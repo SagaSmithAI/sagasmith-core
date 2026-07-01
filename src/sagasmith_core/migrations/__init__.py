@@ -1,0 +1,2 @@
+"""Bundled Alembic migrations."""
+
