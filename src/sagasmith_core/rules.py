@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,8 +17,10 @@ from sagasmith_core.parsing import MarkdownHierarchyParser
 from sagasmith_core.retrieval import (
     SearchHit,
     cosine_similarity,
+    enrich_query,
     lexical_score,
     reciprocal_rank_fusion,
+    structured_score,
 )
 from sagasmith_core.vector import VectorStore
 
@@ -218,7 +221,9 @@ class RuleService:
         top_k: int = 8,
         embedder: Embedder | None = None,
         vector_store: VectorStore | None = None,
+        query_hints: dict[str, Sequence[str]] | None = None,
     ) -> list[SearchHit]:
+        enriched = enrich_query(query, extra_terms=query_hints)
         with self.database.transaction() as session:
             statement = (
                 select(RuleChunk, RuleSection, RuleSource)
@@ -244,9 +249,11 @@ class RuleService:
         ]
         lexical = sorted(
             rows,
-            key=lambda row: -lexical_score(
-                query,
-                title=row.RuleSection.title,
+            key=lambda row: -structured_score(
+                enriched,
+                section_title=row.RuleSection.title,
+                source_title=row.RuleSource.title,
+                heading_paths=" ".join(row.RuleChunk.heading_path or []),
                 content=row.RuleChunk.content,
             ),
         )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -34,8 +35,10 @@ from sagasmith_core.parsing import MarkdownHierarchyParser
 from sagasmith_core.retrieval import (
     SearchHit,
     cosine_similarity,
+    enrich_query,
     lexical_score,
     reciprocal_rank_fusion,
+    structured_score,
 )
 from sagasmith_core.vector import VectorStore
 
@@ -742,11 +745,14 @@ class ModuleService:
         top_k: int = 8,
         embedder: Embedder | None = None,
         vector_store: VectorStore | None = None,
+        query_hints: dict[str, Sequence[str]] | None = None,
     ) -> list[SearchHit]:
+        enriched = enrich_query(query, extra_terms=query_hints)
         with self.database.transaction() as session:
             rows = session.execute(
-                select(ModuleChunk, ModuleScene, ModuleSource)
+                select(ModuleChunk, ModuleScene, ModuleChapter, ModuleSource)
                 .join(ModuleScene, ModuleScene.id == ModuleChunk.scene_id)
+                .join(ModuleChapter, ModuleChapter.id == ModuleScene.chapter_id)
                 .join(ModuleSource, ModuleSource.id == ModuleChunk.module_id)
                 .where(
                     ModuleSource.campaign_id == campaign_id,
@@ -760,13 +766,21 @@ class ModuleService:
             row
             for row in rows
             if row.ModuleScene.title.casefold() == query.casefold()
+            or row.ModuleChapter.title.casefold() == query.casefold()
             or row.ModuleSource.title.casefold() == query.casefold()
         ]
         lexical = sorted(
             rows,
-            key=lambda row: -lexical_score(
-                query,
-                title=row.ModuleScene.title,
+            key=lambda row: -structured_score(
+                enriched,
+                module_title=row.ModuleSource.title,
+                chapter_title=row.ModuleChapter.title,
+                scene_title=row.ModuleScene.title,
+                heading_paths=" ".join(row.ModuleScene.headings or []),
+                keywords=" ".join(row.ModuleScene.keywords or []),
+                tags=" ".join(row.ModuleScene.metadata_json.get("tags", [])),
+                scene_type=row.ModuleScene.scene_type,
+                chunk_type=row.ModuleChunk.chunk_type,
                 content=row.ModuleChunk.content,
             ),
         )
