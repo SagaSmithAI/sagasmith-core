@@ -167,6 +167,46 @@ class MapService:
         with self.database.transaction() as session:
             return self._token_info(self._token(session, token_id))
 
+    def update_token(
+        self,
+        token_id: str,
+        *,
+        actor_type: str | None = None,
+        actor_id: str | None = None,
+        name: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        disposition: str | None = None,
+        hidden: bool | None = None,
+        vision: dict[str, Any] | None = None,
+        actor_delta: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SceneTokenInfo:
+        with self.database.transaction() as session:
+            row = self._token(session, token_id)
+            if actor_type is not None:
+                row.actor_type = actor_type or "character"
+            if actor_id is not None:
+                row.actor_id = actor_id or ""
+            if name is not None:
+                row.name = name
+            if width is not None:
+                row.width = max(1, int(width))
+            if height is not None:
+                row.height = max(1, int(height))
+            if disposition is not None:
+                row.disposition = disposition or "neutral"
+            if hidden is not None:
+                row.hidden = bool(hidden)
+            if vision is not None:
+                row.vision = dict(vision)
+            if actor_delta is not None:
+                row.actor_delta = dict(actor_delta)
+            if metadata is not None:
+                row.metadata_json = {**dict(row.metadata_json or {}), **metadata}
+            session.flush()
+            return self._token_info(row)
+
     def move_token(
         self,
         token_id: str,

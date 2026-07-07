@@ -41,6 +41,19 @@ def test_map_scene_token_region_snapshot_and_undo(database) -> None:
         after=moved.__dict__,
     )
     assert maps.get_token(token.id).x == 30
+    updated_token = maps.update_token(
+        token.id,
+        name="Hidden Hero",
+        hidden=True,
+        disposition="friendly",
+        vision={"darkvision": 60},
+        metadata={"controlled": True},
+    )
+    assert updated_token.name == "Hidden Hero"
+    assert updated_token.hidden is True
+    assert updated_token.disposition == "friendly"
+    assert updated_token.vision["darkvision"] == 60
+    assert updated_token.metadata["controlled"] is True
 
     revisions.undo(campaign.id)
     assert maps.get_token(token.id).x == 10
