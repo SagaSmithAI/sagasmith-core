@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from sagasmith_core.campaigns import CampaignNotFoundError
 from sagasmith_core.database import Database
-from sagasmith_core.models import Campaign, Character, ItemInstance, ItemLedgerEntry, ItemTemplate
+from sagasmith_core.models import Campaign, ItemInstance, ItemLedgerEntry, ItemTemplate
 
 
 OWNER_TYPES = {"character", "party", "npc", "location", "container"}
@@ -61,42 +61,6 @@ class ItemLedgerInfo:
     before: dict[str, Any] | None
     after: dict[str, Any] | None
     created_at: str
-
-
-def normalize_inventory(value: Any) -> list[dict[str, Any]]:
-    """Accept legacy inventory shapes and return strict item dictionaries."""
-    if value in (None, ""):
-        return []
-    if not isinstance(value, list):
-        raise ValueError("inventory must be a list")
-    result: list[dict[str, Any]] = []
-    for index, raw in enumerate(value):
-        if isinstance(raw, str):
-            item = {"name": raw, "quantity": 1}
-        elif isinstance(raw, dict):
-            item = dict(raw)
-        else:
-            raise ValueError(f"inventory item {index} must be an object or string")
-        name = str(item.get("name") or item.get("title") or "").strip()
-        if not name:
-            raise ValueError(f"inventory item {index} is missing name")
-        quantity = int(item.get("quantity", item.get("count", 1)) or 1)
-        if quantity < 0:
-            raise ValueError("quantity cannot be negative")
-        normalized = {
-            "name": name,
-            "quantity": quantity,
-            "category": str(item.get("category") or "gear"),
-            "equipped_slot": item.get("equipped_slot") or item.get("slot"),
-            "attunement": str(item.get("attunement") or "none"),
-            "identified": bool(item.get("identified", True)),
-            "charges": dict(item.get("charges") or {}),
-            "condition": str(item.get("condition") or "normal"),
-            "state": dict(item.get("state") or item.get("metadata") or {}),
-            "template": dict(item.get("template") or {}),
-        }
-        result.append(normalized)
-    return result
 
 
 class InventoryService:
@@ -356,112 +320,6 @@ class InventoryService:
         with self.database.transaction() as session:
             self._campaign(session, campaign_id)
             return [self._ledger_info(row) for row in session.scalars(statement)]
-
-    def import_inventory(
-        self,
-        *,
-        campaign_id: str,
-        character_id: str,
-        inventory: list[dict[str, Any]],
-        replace: bool = False,
-        actor: str = "runtime",
-    ) -> list[ItemInfo]:
-        with self.database.transaction() as session:
-            self._campaign(session, campaign_id)
-            character = session.get(Character, character_id)
-            if character is None or character.campaign_id != campaign_id:
-                raise LookupError(character_id)
-            if replace:
-                rows = list(
-                    session.scalars(
-                        select(ItemInstance).where(
-                            ItemInstance.campaign_id == campaign_id,
-                            ItemInstance.owner_type == "character",
-                            ItemInstance.owner_id == character_id,
-                        )
-                    )
-                )
-                for row in rows:
-                    before = self._item_dict(row)
-                    session.delete(row)
-                    self._ledger(
-                        session,
-                        campaign_id,
-                        row.id,
-                        "delete",
-                        before,
-                        None,
-                        actor,
-                        "replace character inventory",
-                    )
-            result: list[ItemInfo] = []
-            for item in inventory:
-                template = None
-                template_data = dict(item.get("template") or {})
-                source_key = template_data.get("source_key")
-                if source_key:
-                    template = session.scalar(
-                        select(ItemTemplate).where(
-                            ItemTemplate.system_id == character.system_id,
-                            ItemTemplate.source_key == source_key,
-                        )
-                    )
-                if template is None and (source_key or template_data):
-                    template = ItemTemplate(
-                        id=str(uuid.uuid4()),
-                        system_id=character.system_id,
-                        source_key=source_key or f"custom:{item['name'].lower().replace(' ', '-')}",
-                        name=template_data.get("name") or item["name"],
-                        category=item.get("category") or template_data.get("category") or "gear",
-                        rarity=template_data.get("rarity") or "",
-                        tags=list(template_data.get("tags") or []),
-                        weight=int(template_data.get("weight") or 0),
-                        value=dict(template_data.get("value") or {}),
-                        rules=dict(template_data.get("rules") or {}),
-                        description=template_data.get("description") or "",
-                        metadata_json=dict(template_data.get("metadata") or {}),
-                    )
-                    session.add(template)
-                    session.flush()
-                row = ItemInstance(
-                    id=str(uuid.uuid4()),
-                    campaign_id=campaign_id,
-                    template_id=template.id if template else None,
-                    name=item["name"],
-                    owner_type="character",
-                    owner_id=character_id,
-                    quantity=item["quantity"],
-                    equipped_slot=item.get("equipped_slot"),
-                    attunement=item.get("attunement", "none"),
-                    identified=bool(item.get("identified", True)),
-                    charges=dict(item.get("charges") or {}),
-                    condition=item.get("condition", "normal"),
-                    state=dict(item.get("state") or {}),
-                )
-                session.add(row)
-                session.flush()
-                after = self._item_dict(row)
-                self._ledger(session, campaign_id, row.id, "add", None, after, actor, "import inventory")
-                result.append(self._item_info(row))
-            return result
-
-    def character_inventory(self, character_id: str) -> list[dict[str, Any]]:
-        with self.database.transaction() as session:
-            character = session.get(Character, character_id)
-            if character is None:
-                raise LookupError(character_id)
-            if character.campaign_id is None:
-                return []
-            rows = session.scalars(
-                select(ItemInstance)
-                .where(
-                    ItemInstance.campaign_id == character.campaign_id,
-                    ItemInstance.owner_type == "character",
-                    ItemInstance.owner_id == character_id,
-                )
-                .order_by(ItemInstance.name, ItemInstance.id)
-            )
-            return [self._item_dict(row) for row in rows]
 
     @staticmethod
     def _validate_owner(owner_type: str, owner_id: str) -> None:

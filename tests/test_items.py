@@ -1,5 +1,5 @@
 from sagasmith_core.campaigns import CampaignService
-from sagasmith_core.items import InventoryService, normalize_inventory
+from sagasmith_core.items import InventoryService
 from sagasmith_core.revisions import RevisionService
 from sagasmith_core.snapshots import SnapshotService
 
@@ -105,16 +105,3 @@ def test_snapshot_restores_item_instances(database) -> None:
     restored = inventory.get_item(item.id)
     assert restored.owner_type == "party"
     assert restored.owner_id == "party"
-
-
-def test_normalize_legacy_inventory_shapes() -> None:
-    values = normalize_inventory(
-        [
-            "Torch",
-            {"name": "Rope", "count": 1, "metadata": {"length": "50 ft"}},
-        ]
-    )
-
-    assert values[0]["name"] == "Torch"
-    assert values[0]["quantity"] == 1
-    assert values[1]["state"] == {"length": "50 ft"}
