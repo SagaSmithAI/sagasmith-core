@@ -8,9 +8,11 @@ from typing import Any
 
 from sqlalchemy import select
 
+from sagasmith_core.branches import resolve_branch
 from sagasmith_core.campaigns import CampaignNotFoundError
 from sagasmith_core.database import Database
 from sagasmith_core.models import (
+    BranchFactHead,
     Campaign,
     CampaignMemory,
     CampaignSnapshot,
@@ -44,12 +46,16 @@ class MemoryService:
         subject: str = "",
         metadata: dict[str, Any] | None = None,
         snapshot_id: str | None = None,
+        branch_id: str | None = None,
     ) -> MemoryInfo:
         with self.database.transaction() as session:
             if session.get(Campaign, campaign_id) is None:
                 raise CampaignNotFoundError(campaign_id)
-            if snapshot_id and session.get(CampaignSnapshot, snapshot_id) is None:
-                raise LookupError(snapshot_id)
+            branch = resolve_branch(session, session.get(Campaign, campaign_id), branch_id)
+            if snapshot_id:
+                snapshot = session.get(CampaignSnapshot, snapshot_id)
+                if snapshot is None or snapshot.campaign_id != campaign_id:
+                    raise LookupError(snapshot_id)
             memory = CampaignMemory(
                 id=str(uuid.uuid4()),
                 campaign_id=campaign_id,
@@ -65,6 +71,9 @@ class MemoryService:
             )
             session.add_all([memory, revision])
             session.flush()
+            session.add(
+                BranchFactHead(branch_id=branch.id, memory_id=memory.id, revision_id=revision.id)
+            )
             return self._info(memory, revision)
 
     def revise(
@@ -74,18 +83,29 @@ class MemoryService:
         content: str,
         metadata: dict[str, Any] | None = None,
         snapshot_id: str | None = None,
+        branch_id: str | None = None,
     ) -> MemoryInfo:
         with self.database.transaction() as session:
             memory = session.get(CampaignMemory, memory_id)
             if memory is None:
                 raise LookupError(memory_id)
-            current = session.scalar(
-                select(MemoryRevision)
-                .where(
-                    MemoryRevision.memory_id == memory_id,
-                    MemoryRevision.active.is_(True),
+            campaign = session.get(Campaign, memory.campaign_id)
+            if campaign is None:
+                raise CampaignNotFoundError(memory.campaign_id)
+            branch = resolve_branch(session, campaign, branch_id)
+            if snapshot_id:
+                snapshot = session.get(CampaignSnapshot, snapshot_id)
+                if snapshot is None or snapshot.campaign_id != memory.campaign_id:
+                    raise LookupError(snapshot_id)
+            head = session.get(BranchFactHead, {"branch_id": branch.id, "memory_id": memory_id})
+            current = (
+                session.get(MemoryRevision, head.revision_id)
+                if head
+                else session.scalar(
+                    select(MemoryRevision)
+                    .where(MemoryRevision.memory_id == memory_id, MemoryRevision.active.is_(True))
+                    .order_by(MemoryRevision.created_at.desc())
                 )
-                .order_by(MemoryRevision.created_at.desc())
             )
             if current:
                 current.active = False
@@ -99,17 +119,33 @@ class MemoryService:
             )
             session.add(revision)
             session.flush()
+            if head is None:
+                session.add(
+                    BranchFactHead(
+                        branch_id=branch.id, memory_id=memory_id, revision_id=revision.id
+                    )
+                )
+            else:
+                head.revision_id = revision.id
             return self._info(memory, revision)
 
-    def list(self, campaign_id: str, *, kind: str | None = None) -> list[MemoryInfo]:
+    def list(
+        self,
+        campaign_id: str,
+        *,
+        kind: str | None = None,
+        branch_id: str | None = None,
+    ) -> list[MemoryInfo]:
         with self.database.transaction() as session:
+            campaign = session.get(Campaign, campaign_id)
+            if campaign is None:
+                raise CampaignNotFoundError(campaign_id)
+            branch = resolve_branch(session, campaign, branch_id)
             statement = (
                 select(CampaignMemory, MemoryRevision)
-                .join(MemoryRevision, MemoryRevision.memory_id == CampaignMemory.id)
-                .where(
-                    CampaignMemory.campaign_id == campaign_id,
-                    MemoryRevision.active.is_(True),
-                )
+                .join(BranchFactHead, BranchFactHead.memory_id == CampaignMemory.id)
+                .join(MemoryRevision, MemoryRevision.id == BranchFactHead.revision_id)
+                .where(BranchFactHead.branch_id == branch.id)
                 .order_by(CampaignMemory.updated_at.desc(), CampaignMemory.id)
             )
             if kind:
@@ -122,14 +158,17 @@ class MemoryService:
         query: str,
         *,
         limit: int = 8,
+        branch_id: str | None = None,
     ) -> list[MemoryInfo]:
-        values = self.list(campaign_id)
+        values = self.list(campaign_id, branch_id=branch_id)
         ranked = sorted(
             values,
-            key=lambda item: -lexical_score(
-                query,
-                title=item.subject,
-                content=item.content,
+            key=lambda item: (
+                -lexical_score(
+                    query,
+                    title=item.subject,
+                    content=item.content,
+                )
             ),
         )
         return ranked[: max(1, min(limit, 100))]

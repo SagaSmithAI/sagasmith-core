@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy import select
 
 from sagasmith_core.database import Database
-from sagasmith_core.models import Campaign
+from sagasmith_core.models import Campaign, CampaignBranch
 
 
 class CampaignNotFoundError(LookupError):
@@ -61,6 +61,15 @@ class CampaignService:
         with self.database.transaction() as session:
             session.add(row)
             session.flush()
+            branch = CampaignBranch(
+                id=str(uuid.uuid4()),
+                campaign_id=row.id,
+                name="main",
+                is_current=True,
+            )
+            session.add(branch)
+            session.flush()
+            row.active_branch_id = branch.id
             return self._info(row)
 
     def get(self, campaign_id: str) -> CampaignInfo:

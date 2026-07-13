@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 
 from sagasmith_core import (
+    ActorKnowledgeService,
+    BranchService,
     CampaignService,
     CharacterService,
     CharacterStateUpdate,
@@ -217,6 +219,59 @@ def test_snapshot_restore_preserves_its_undo_cursor_and_retires_future_revisions
         revisions.redo(campaign.id)
     revisions.undo(campaign.id)
     assert campaigns.get(campaign.id).state == {"clock": 0}
+
+
+def test_branch_scoped_facts_events_and_actor_knowledge_do_not_leak(database) -> None:
+    campaign = CampaignService(database).create(system_id="dnd5e", name="Knowledge branches")
+    actor = CharacterService(database).create(
+        system_id="dnd5e",
+        campaign_id=campaign.id,
+        name="Guard",
+        character_type="npc",
+        sheet={},
+        notes={},
+    )
+    events = EventService(database)
+    memories = MemoryService(database)
+    knowledge = ActorKnowledgeService(database)
+    snapshots = SnapshotService(database)
+
+    witnessed = events.add(campaign.id, summary="The guard sees the cellar key")
+    fact = memories.add(campaign.id, subject="Cellar key", content="The key is in the cellar.")
+    belief = knowledge.add(
+        campaign.id,
+        actor_id=actor.id,
+        knowledge_key="cellar-key-location",
+        proposition="The key is in the cellar.",
+        source_event_id=witnessed.id,
+    )
+    base = snapshots.create(campaign.id, label="Key seen")
+    main = BranchService(database).current(campaign.id)
+
+    memories.revise(fact.id, content="The key is now in the guard room.")
+    knowledge.revise(
+        belief.id,
+        proposition="The key was moved to the guard room.",
+        epistemic_status="belief",
+    )
+    events.add(campaign.id, summary="The key is moved")
+
+    alternate = BranchService(database).create(
+        campaign.id,
+        name="key-stays-put",
+        from_snapshot_id=base.id,
+        checkout=True,
+    )
+    snapshots.checkout_branch(campaign.id, alternate.id)
+
+    assert memories.list(campaign.id)[0].content == "The key is in the cellar."
+    assert knowledge.list(campaign.id, actor_id=actor.id)[0].proposition.endswith("cellar.")
+    assert [item.summary for item in events.list(campaign.id)] == ["The guard sees the cellar key"]
+
+    assert memories.list(campaign.id, branch_id=main.id)[0].content.endswith("guard room.")
+    assert knowledge.list(campaign.id, actor_id=actor.id, branch_id=main.id)[
+        0
+    ].proposition.endswith("guard room.")
 
 
 def test_state_mutation_replaces_campaign_and_character_documents_atomically(database) -> None:

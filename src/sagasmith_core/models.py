@@ -52,6 +52,9 @@ class Campaign(TimestampMixin, Base):
     settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     revision: Mapped[int] = mapped_column(Integer, default=1)
+    active_branch_id: Mapped[str | None] = mapped_column(
+        ForeignKey("campaign_branches.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
 
 class Character(TimestampMixin, Base):
@@ -88,9 +91,7 @@ class Character(TimestampMixin, Base):
 
 class RuleSource(TimestampMixin, Base):
     __tablename__ = "rule_sources"
-    __table_args__ = (
-        UniqueConstraint("system_id", "source_key", name="uq_rule_source_key"),
-    )
+    __table_args__ = (UniqueConstraint("system_id", "source_key", name="uq_rule_source_key"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     system_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -111,9 +112,7 @@ class RuleSource(TimestampMixin, Base):
 
 class RuleSection(Base):
     __tablename__ = "rule_sections"
-    __table_args__ = (
-        Index("ix_rule_section_source_order", "source_id", "ordinal"),
-    )
+    __table_args__ = (Index("ix_rule_section_source_order", "source_id", "ordinal"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     source_id: Mapped[str] = mapped_column(
@@ -135,9 +134,7 @@ class RuleSection(Base):
 
 class RuleChunk(Base):
     __tablename__ = "rule_chunks"
-    __table_args__ = (
-        Index("ix_rule_chunk_source_order", "source_id", "ordinal"),
-    )
+    __table_args__ = (Index("ix_rule_chunk_source_order", "source_id", "ordinal"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     source_id: Mapped[str] = mapped_column(
@@ -313,6 +310,13 @@ class CampaignEvent(Base):
     event_type: Mapped[str] = mapped_column(String(64), default="narrative")
     summary: Mapped[str] = mapped_column(Text, default="")
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    audience_scope: Mapped[str] = mapped_column(String(200), default="dm")
+    branch_id: Mapped[str | None] = mapped_column(
+        ForeignKey("campaign_branches.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    committed_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("campaign_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -378,6 +382,9 @@ class CampaignSnapshot(Base):
         ForeignKey("campaigns.id", ondelete="CASCADE"),
         index=True,
     )
+    branch_id: Mapped[str | None] = mapped_column(
+        ForeignKey("campaign_branches.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     parent_id: Mapped[str | None] = mapped_column(
         ForeignKey("campaign_snapshots.id", ondelete="SET NULL"),
         nullable=True,
@@ -426,6 +433,145 @@ class MemoryRevision(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class CampaignBranch(TimestampMixin, Base):
+    """A playable D&D timeline; branches are refs, never destructive restores."""
+
+    __tablename__ = "campaign_branches"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "name", name="uq_campaign_branch_name"),
+        Index("ix_campaign_branch_current", "campaign_id", "is_current"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(
+        ForeignKey("campaigns.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    base_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("campaign_snapshots.id", ondelete="SET NULL"), nullable=True
+    )
+    head_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("campaign_snapshots.id", ondelete="SET NULL"), nullable=True
+    )
+    is_current: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class BranchFactHead(Base):
+    """The current campaign-fact revision in one branch worktree."""
+
+    __tablename__ = "branch_fact_heads"
+
+    branch_id: Mapped[str] = mapped_column(
+        ForeignKey("campaign_branches.id", ondelete="CASCADE"), primary_key=True
+    )
+    memory_id: Mapped[str] = mapped_column(
+        ForeignKey("campaign_memories.id", ondelete="CASCADE"), primary_key=True
+    )
+    revision_id: Mapped[str] = mapped_column(
+        ForeignKey("memory_revisions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+
+class SnapshotFactBinding(Base):
+    """The exact campaign-fact revision set visible at a snapshot."""
+
+    __tablename__ = "snapshot_fact_bindings"
+
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("campaign_snapshots.id", ondelete="CASCADE"), primary_key=True
+    )
+    memory_id: Mapped[str] = mapped_column(
+        ForeignKey("campaign_memories.id", ondelete="CASCADE"), primary_key=True
+    )
+    revision_id: Mapped[str] = mapped_column(
+        ForeignKey("memory_revisions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+
+class SnapshotEventBinding(Base):
+    """The ordered event ledger visible at a snapshot."""
+
+    __tablename__ = "snapshot_event_bindings"
+
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("campaign_snapshots.id", ondelete="CASCADE"), primary_key=True
+    )
+    event_id: Mapped[str] = mapped_column(
+        ForeignKey("campaign_events.id", ondelete="CASCADE"), primary_key=True
+    )
+
+
+class ActorKnowledge(Base):
+    """Stable identity for a fact held by one live campaign actor."""
+
+    __tablename__ = "actor_knowledge"
+    __table_args__ = (
+        UniqueConstraint("actor_id", "knowledge_key", name="uq_actor_knowledge_key"),
+        Index("ix_actor_knowledge_campaign_actor", "campaign_id", "actor_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(
+        ForeignKey("campaigns.id", ondelete="CASCADE"), index=True
+    )
+    # Actor documents are materialized per checked-out branch.  This identity must
+    # survive a different branch temporarily removing that character from the live
+    # Character table, so it is deliberately validated by the service, not cascaded.
+    actor_id: Mapped[str] = mapped_column(String(36), index=True)
+    knowledge_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    subject_ref: Mapped[str] = mapped_column(String(200), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ActorKnowledgeRevision(Base):
+    __tablename__ = "actor_knowledge_revisions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    knowledge_id: Mapped[str] = mapped_column(
+        ForeignKey("actor_knowledge.id", ondelete="CASCADE"), index=True
+    )
+    parent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("actor_knowledge_revisions.id", ondelete="SET NULL"), nullable=True
+    )
+    proposition: Mapped[str] = mapped_column(Text, nullable=False)
+    epistemic_status: Mapped[str] = mapped_column(String(32), default="known")
+    confidence: Mapped[int] = mapped_column(Integer, default=3)
+    source_event_id: Mapped[str | None] = mapped_column(
+        ForeignKey("campaign_events.id", ondelete="SET NULL"), nullable=True
+    )
+    cause: Mapped[str] = mapped_column(String(64), default="witnessed")
+    disclosure_scope: Mapped[str] = mapped_column(String(200), default="dm")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class BranchActorKnowledgeHead(Base):
+    __tablename__ = "branch_actor_knowledge_heads"
+
+    branch_id: Mapped[str] = mapped_column(
+        ForeignKey("campaign_branches.id", ondelete="CASCADE"), primary_key=True
+    )
+    knowledge_id: Mapped[str] = mapped_column(
+        ForeignKey("actor_knowledge.id", ondelete="CASCADE"), primary_key=True
+    )
+    revision_id: Mapped[str] = mapped_column(
+        ForeignKey("actor_knowledge_revisions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+
+class SnapshotActorKnowledgeBinding(Base):
+    __tablename__ = "snapshot_actor_knowledge_bindings"
+
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("campaign_snapshots.id", ondelete="CASCADE"), primary_key=True
+    )
+    knowledge_id: Mapped[str] = mapped_column(
+        ForeignKey("actor_knowledge.id", ondelete="CASCADE"), primary_key=True
+    )
+    revision_id: Mapped[str] = mapped_column(
+        ForeignKey("actor_knowledge_revisions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+
 class VectorIndexJob(TimestampMixin, Base):
     __tablename__ = "vector_index_jobs"
     __table_args__ = (
@@ -453,9 +599,7 @@ class VectorIndexJob(TimestampMixin, Base):
 
 class ModuleAsset(TimestampMixin, Base):
     __tablename__ = "module_assets"
-    __table_args__ = (
-        UniqueConstraint("module_id", "source_path", name="uq_module_asset_path"),
-    )
+    __table_args__ = (UniqueConstraint("module_id", "source_path", name="uq_module_asset_path"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     module_id: Mapped[str] = mapped_column(

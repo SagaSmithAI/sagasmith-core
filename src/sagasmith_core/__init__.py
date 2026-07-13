@@ -1,7 +1,9 @@
 """Shared runtime contracts for SagaSmith system packages."""
 
+from sagasmith_core.branches import BranchService
 from sagasmith_core.campaigns import CampaignService
 from sagasmith_core.characters import CharacterService
+from sagasmith_core.continuity import ContinuityService
 from sagasmith_core.database import Database
 from sagasmith_core.documents import (
     DocumentQualityError,
@@ -18,6 +20,7 @@ from sagasmith_core.embeddings import (
     create_embedder,
 )
 from sagasmith_core.events import EventService
+from sagasmith_core.knowledge import ActorKnowledgeService
 from sagasmith_core.memory import MemoryService
 from sagasmith_core.modules import ModuleService
 from sagasmith_core.revisions import RevisionService
@@ -33,9 +36,12 @@ __all__ = [
     "BgeM3Embedder",
     "BgeSmallEnEmbedder",
     "BgeSmallZhEmbedder",
+    "ActorKnowledgeService",
+    "BranchService",
     "CampaignService",
     "CharacterStateUpdate",
     "CharacterService",
+    "ContinuityService",
     "Database",
     "DocumentQualityError",
     "EmbeddingProfile",

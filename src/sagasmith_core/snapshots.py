@@ -12,10 +12,16 @@ from typing import Any
 
 from sqlalchemy import delete, func, select, update
 
+from sagasmith_core.branches import BranchService, resolve_branch
 from sagasmith_core.campaigns import CampaignNotFoundError
 from sagasmith_core.database import Database
 from sagasmith_core.models import (
+    ActorKnowledge,
+    ActorKnowledgeRevision,
+    BranchActorKnowledgeHead,
+    BranchFactHead,
     Campaign,
+    CampaignBranch,
     CampaignEvent,
     CampaignMemory,
     CampaignRuleProfile,
@@ -23,6 +29,9 @@ from sagasmith_core.models import (
     Character,
     MemoryRevision,
     SceneProgress,
+    SnapshotActorKnowledgeBinding,
+    SnapshotEventBinding,
+    SnapshotFactBinding,
     StateRevision,
 )
 
@@ -41,6 +50,7 @@ class SnapshotInfo:
     checksum: str
     is_head: bool
     created_at: str
+    branch_id: str | None = None
 
 
 def _canonical_json(value: dict[str, Any]) -> str:
@@ -69,15 +79,8 @@ class SnapshotService:
             campaign = session.get(Campaign, campaign_id)
             if campaign is None:
                 raise CampaignNotFoundError(campaign_id)
-            head = session.scalar(
-                select(CampaignSnapshot)
-                .where(
-                    CampaignSnapshot.campaign_id == campaign_id,
-                    CampaignSnapshot.is_head.is_(True),
-                )
-                .order_by(CampaignSnapshot.slot.desc())
-            )
-            parent_id = parent_id if parent_id is not None else (head.id if head else None)
+            branch = resolve_branch(session, campaign)
+            parent_id = parent_id if parent_id is not None else branch.head_snapshot_id
             if parent_id:
                 parent = session.get(CampaignSnapshot, parent_id)
                 if parent is None or parent.campaign_id != campaign_id:
@@ -90,12 +93,10 @@ class SnapshotService:
                 )
                 or 0
             ) + 1
-            payload = self._capture(session, campaign)
+            payload = self._capture(session, campaign, branch.id)
             if recap is None:
                 parent_payload = (
-                    dict(session.get(CampaignSnapshot, parent_id).payload)
-                    if parent_id
-                    else None
+                    dict(session.get(CampaignSnapshot, parent_id).payload) if parent_id else None
                 )
                 recap = self._build_recap(parent_payload, payload)
             session.execute(
@@ -106,6 +107,7 @@ class SnapshotService:
             row = CampaignSnapshot(
                 id=str(uuid.uuid4()),
                 campaign_id=campaign_id,
+                branch_id=branch.id,
                 parent_id=parent_id,
                 slot=slot,
                 label=label,
@@ -117,6 +119,8 @@ class SnapshotService:
             )
             session.add(row)
             session.flush()
+            self._bind_continuity(session, row, branch)
+            branch.head_snapshot_id = row.id
             return self._info(row)
 
     def regenerate_recap(self, campaign_id: str, slot: int) -> dict[str, Any]:
@@ -165,6 +169,12 @@ class SnapshotService:
                 "snapshot schema is unsupported; create a new snapshot with the current runtime"
             )
         self.create(campaign_id, label=f"Before restore to slot {slot}")
+        BranchService(self.database).create(
+            campaign_id,
+            name=f"restore-{slot}-{uuid.uuid4().hex[:8]}",
+            from_snapshot_id=target["id"],
+            checkout=True,
+        )
         with self.database.transaction() as session:
             campaign = session.get(Campaign, campaign_id)
             if campaign is None:
@@ -176,16 +186,32 @@ class SnapshotService:
             parent_id=target["id"],
         )
 
+    def checkout_branch(self, campaign_id: str, branch_id: str) -> SnapshotInfo | None:
+        """Materialize a branch head without creating or deleting history."""
+
+        branch = BranchService(self.database).checkout(campaign_id, branch_id)
+        if branch.head_snapshot_id is None:
+            return None
+        with self.database.transaction() as session:
+            campaign = session.get(Campaign, campaign_id)
+            row = session.get(CampaignSnapshot, branch.head_snapshot_id)
+            if campaign is None:
+                raise CampaignNotFoundError(campaign_id)
+            if row is None or row.campaign_id != campaign_id:
+                raise LookupError(branch.head_snapshot_id)
+            if _checksum(row.payload) != row.checksum:
+                raise SnapshotIntegrityError("branch head failed checksum verification")
+            self._apply(session, campaign, dict(row.payload))
+            return self._info(row)
+
     def lineage(self, campaign_id: str, slot: int | None = None) -> list[SnapshotInfo]:
         with self.database.transaction() as session:
             if slot is None:
-                row = session.scalar(
-                    select(CampaignSnapshot)
-                    .where(
-                        CampaignSnapshot.campaign_id == campaign_id,
-                        CampaignSnapshot.is_head.is_(True),
-                    )
-                    .order_by(CampaignSnapshot.slot.desc())
+                campaign = session.get(Campaign, campaign_id)
+                if campaign is None:
+                    raise CampaignNotFoundError(campaign_id)
+                row = session.get(
+                    CampaignSnapshot, resolve_branch(session, campaign).head_snapshot_id
                 )
             else:
                 row = self._row(session, campaign_id, slot)
@@ -222,13 +248,11 @@ class SnapshotService:
                 parent.is_head = True
 
     @staticmethod
-    def _capture(session, campaign: Campaign) -> dict[str, Any]:
+    def _capture(session, campaign: Campaign, branch_id: str) -> dict[str, Any]:
         profile = session.get(CampaignRuleProfile, campaign.id)
         characters = list(
             session.scalars(
-                select(Character)
-                .where(Character.campaign_id == campaign.id)
-                .order_by(Character.id)
+                select(Character).where(Character.campaign_id == campaign.id).order_by(Character.id)
             )
         )
         progress = list(
@@ -240,19 +264,24 @@ class SnapshotService:
         )
         memory_rows = session.execute(
             select(CampaignMemory, MemoryRevision)
-            .join(MemoryRevision, MemoryRevision.memory_id == CampaignMemory.id)
-            .where(
-                CampaignMemory.campaign_id == campaign.id,
-                MemoryRevision.active.is_(True),
-            )
+            .join(BranchFactHead, BranchFactHead.memory_id == CampaignMemory.id)
+            .join(MemoryRevision, MemoryRevision.id == BranchFactHead.revision_id)
+            .where(BranchFactHead.branch_id == branch_id)
             .order_by(CampaignMemory.id)
         )
-        events = list(
-            session.scalars(
-                select(CampaignEvent)
-                .where(CampaignEvent.campaign_id == campaign.id)
-                .order_by(CampaignEvent.sequence)
+        events = SnapshotService._visible_events(session, campaign.id, branch_id)
+        knowledge_rows = session.execute(
+            select(ActorKnowledge, ActorKnowledgeRevision)
+            .join(
+                BranchActorKnowledgeHead,
+                BranchActorKnowledgeHead.knowledge_id == ActorKnowledge.id,
             )
+            .join(
+                ActorKnowledgeRevision,
+                ActorKnowledgeRevision.id == BranchActorKnowledgeHead.revision_id,
+            )
+            .where(BranchActorKnowledgeHead.branch_id == branch_id)
+            .order_by(ActorKnowledge.actor_id, ActorKnowledge.knowledge_key)
         )
         revisions = list(
             session.scalars(
@@ -316,6 +345,7 @@ class SnapshotService:
                     "event_type": row.event_type,
                     "summary": row.summary,
                     "payload": dict(row.payload),
+                    "audience_scope": row.audience_scope,
                     "created_at": row.created_at.isoformat(),
                 }
                 for row in events
@@ -336,6 +366,24 @@ class SnapshotService:
                     },
                 }
                 for memory, revision in memory_rows
+            ],
+            "actor_knowledge": [
+                {
+                    "id": knowledge.id,
+                    "actor_id": knowledge.actor_id,
+                    "knowledge_key": knowledge.knowledge_key,
+                    "subject_ref": knowledge.subject_ref,
+                    "revision": {
+                        "id": revision.id,
+                        "proposition": revision.proposition,
+                        "epistemic_status": revision.epistemic_status,
+                        "confidence": revision.confidence,
+                        "source_event_id": revision.source_event_id,
+                        "cause": revision.cause,
+                        "disclosure_scope": revision.disclosure_scope,
+                    },
+                }
+                for knowledge, revision in knowledge_rows
             ],
             "revision_cursor": [
                 {
@@ -372,9 +420,7 @@ class SnapshotService:
         old_characters = {item["id"]: item for item in previous.get("characters", [])}
         new_characters = {item["id"]: item for item in current.get("characters", [])}
         character_changes = [
-            item["name"]
-            for key, item in new_characters.items()
-            if old_characters.get(key) != item
+            item["name"] for key, item in new_characters.items() if old_characters.get(key) != item
         ]
         removed = [
             item["name"] for key, item in old_characters.items() if key not in new_characters
@@ -388,9 +434,7 @@ class SnapshotService:
             for item in current.get("scene_progress", [])
             if old_scenes.get((item.get("scope_id", "party"), item["scene_id"])) != item
         ]
-        old_memories = {
-            item["revision"]["id"] for item in previous.get("memories", [])
-        }
+        old_memories = {item["revision"]["id"] for item in previous.get("memories", [])}
         memory_candidates = [
             item["id"]
             for item in current.get("memories", [])
@@ -449,54 +493,13 @@ class SnapshotService:
         for item in payload.get("characters", []):
             session.add(Character(campaign_id=campaign.id, **item))
 
-        session.execute(
-            delete(SceneProgress).where(SceneProgress.campaign_id == campaign.id)
-        )
+        session.execute(delete(SceneProgress).where(SceneProgress.campaign_id == campaign.id))
         for item in payload.get("scene_progress", []):
             item.setdefault("scope_id", "party")
             session.add(SceneProgress(campaign_id=campaign.id, **item))
 
-        session.execute(delete(CampaignEvent).where(CampaignEvent.campaign_id == campaign.id))
-        for item in payload.get("events", []):
-            session.add(
-                CampaignEvent(
-                    campaign_id=campaign.id,
-                    id=item["id"],
-                    sequence=item["sequence"],
-                    event_type=item["event_type"],
-                    summary=item["summary"],
-                    payload=item["payload"],
-                    created_at=_parse_timestamp(item["created_at"]),
-                )
-            )
-
-        session.execute(delete(CampaignMemory).where(CampaignMemory.campaign_id == campaign.id))
-        memories = payload.get("memories", [])
-        for item in memories:
-            session.add(
-                CampaignMemory(
-                    id=item["id"],
-                    campaign_id=campaign.id,
-                    kind=item["kind"],
-                    subject=item["subject"],
-                    created_at=_parse_timestamp(item["created_at"]),
-                    updated_at=_parse_timestamp(item["updated_at"]),
-                )
-            )
-        session.flush()
-        for item in memories:
-            revision = item["revision"]
-            session.add(
-                MemoryRevision(
-                    id=revision["id"],
-                    memory_id=item["id"],
-                    snapshot_id=revision.get("snapshot_id"),
-                    content=revision["content"],
-                    metadata_json=revision["metadata"],
-                    active=True,
-                    created_at=_parse_timestamp(revision["created_at"]),
-                )
-            )
+        # Events, campaign facts, and actor knowledge are immutable ledgers.  Their
+        # branch visibility is selected by bindings, so restore must never delete them.
 
         cursor = {item["id"]: item for item in payload.get("revision_cursor", [])}
         session.execute(
@@ -537,7 +540,69 @@ class SnapshotService:
             checksum=row.checksum,
             is_head=row.is_head,
             created_at=row.created_at.isoformat(),
+            branch_id=row.branch_id,
         )
+
+    @staticmethod
+    def _visible_events(session, campaign_id: str, branch_id: str) -> list[CampaignEvent]:
+        branch = session.get(CampaignBranch, branch_id)
+        bound_ids: set[str] = set()
+        if branch and branch.head_snapshot_id:
+            bound_ids = set(
+                session.scalars(
+                    select(SnapshotEventBinding.event_id).where(
+                        SnapshotEventBinding.snapshot_id == branch.head_snapshot_id
+                    )
+                )
+            )
+        rows = []
+        if bound_ids:
+            rows.extend(
+                session.scalars(
+                    select(CampaignEvent)
+                    .where(CampaignEvent.id.in_(bound_ids))
+                    .order_by(CampaignEvent.sequence)
+                )
+            )
+        rows.extend(
+            session.scalars(
+                select(CampaignEvent)
+                .where(
+                    CampaignEvent.campaign_id == campaign_id,
+                    CampaignEvent.branch_id == branch_id,
+                    CampaignEvent.committed_snapshot_id.is_(None),
+                )
+                .order_by(CampaignEvent.sequence)
+            )
+        )
+        return rows
+
+    @classmethod
+    def _bind_continuity(cls, session, snapshot: CampaignSnapshot, branch: CampaignBranch) -> None:
+        for item in session.scalars(
+            select(BranchFactHead).where(BranchFactHead.branch_id == branch.id)
+        ):
+            session.add(
+                SnapshotFactBinding(
+                    snapshot_id=snapshot.id,
+                    memory_id=item.memory_id,
+                    revision_id=item.revision_id,
+                )
+            )
+        for item in session.scalars(
+            select(BranchActorKnowledgeHead).where(BranchActorKnowledgeHead.branch_id == branch.id)
+        ):
+            session.add(
+                SnapshotActorKnowledgeBinding(
+                    snapshot_id=snapshot.id,
+                    knowledge_id=item.knowledge_id,
+                    revision_id=item.revision_id,
+                )
+            )
+        for event in cls._visible_events(session, snapshot.campaign_id, branch.id):
+            session.add(SnapshotEventBinding(snapshot_id=snapshot.id, event_id=event.id))
+            if event.branch_id == branch.id and event.committed_snapshot_id is None:
+                event.committed_snapshot_id = snapshot.id
 
 
 def _parse_timestamp(value: str) -> datetime:
