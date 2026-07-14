@@ -30,6 +30,8 @@ channel in the reciprocal-rank-fusion pipeline.  Otherwise they fall
 back to ``structured_score()`` as before.
 """
 
+# ruff: noqa: E501
+
 from __future__ import annotations
 
 import math

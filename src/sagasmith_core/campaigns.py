@@ -102,11 +102,14 @@ class CampaignService:
         description: str | None = None,
         settings: dict[str, Any] | None = None,
         state: dict[str, Any] | None = None,
+        expected_revision: int | None = None,
     ) -> CampaignInfo:
         with self.database.transaction() as session:
             row = session.get(Campaign, campaign_id)
             if row is None:
                 raise CampaignNotFoundError(campaign_id)
+            if expected_revision is not None and row.revision != expected_revision:
+                raise ValueError(f"campaign revision conflict: {campaign_id}")
             if name is not None:
                 row.name = name
             if status is not None:
@@ -141,4 +144,3 @@ class CampaignService:
             state=dict(row.state),
             revision=row.revision,
         )
-

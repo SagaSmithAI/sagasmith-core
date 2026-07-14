@@ -1,5 +1,6 @@
 """Shared runtime contracts for SagaSmith system packages."""
 
+from sagasmith_core.access import AccessDeniedError, AccessService, default_local_principal
 from sagasmith_core.branches import BranchService
 from sagasmith_core.campaigns import CampaignService
 from sagasmith_core.characters import CharacterService
@@ -20,6 +21,7 @@ from sagasmith_core.embeddings import (
     create_embedder,
 )
 from sagasmith_core.events import EventService
+from sagasmith_core.idempotency import IdempotencyConflictError, IdempotencyService, request_hash
 from sagasmith_core.knowledge import ActorKnowledgeService
 from sagasmith_core.memory import MemoryService
 from sagasmith_core.modules import ModuleService
@@ -37,6 +39,8 @@ __all__ = [
     "BgeSmallEnEmbedder",
     "BgeSmallZhEmbedder",
     "ActorKnowledgeService",
+    "AccessDeniedError",
+    "AccessService",
     "BranchService",
     "CampaignService",
     "CharacterStateUpdate",
@@ -47,6 +51,8 @@ __all__ = [
     "EmbeddingProfile",
     "EventService",
     "MemoryService",
+    "IdempotencyConflictError",
+    "IdempotencyService",
     "ModuleService",
     "NormalizedDocument",
     "PdfDocumentConverter",
@@ -60,6 +66,8 @@ __all__ = [
     "VectorStore",
     "configured_profiles",
     "create_embedder",
+    "default_local_principal",
+    "request_hash",
 ]
 
 __version__ = "0.2.0"

@@ -37,7 +37,6 @@ from sagasmith_core.retrieval import (
     cosine_similarity,
     enrich_query,
     fts5_hits,
-    lexical_score,
     reciprocal_rank_fusion,
     structured_score,
 )

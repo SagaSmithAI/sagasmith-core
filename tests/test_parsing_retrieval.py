@@ -127,11 +127,12 @@ def test_fts5_query_handles_cjk_and_english() -> None:
 
 
 def test_fts5_hits_produces_results_on_sqlite(database) -> None:
+    from alembic import command
+
     from sagasmith_core.campaigns import CampaignService
     from sagasmith_core.database import alembic_config
     from sagasmith_core.modules import ModuleService
     from sagasmith_core.retrieval import fts5_hits
-    from alembic import command
 
     db = database
     campaign = CampaignService(db).create(system_id="dnd5e", name="FTS")

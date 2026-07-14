@@ -9,6 +9,7 @@ from sagasmith_core.campaigns import CampaignNotFoundError
 from sagasmith_core.characters import CharacterNotFoundError
 from sagasmith_core.database import Database
 from sagasmith_core.models import Campaign, Character
+from sagasmith_core.revisions import RevisionInfo, RevisionService
 
 
 @dataclass(frozen=True)
@@ -38,7 +39,11 @@ class StateMutationService:
         *,
         campaign_state: dict[str, Any] | None = None,
         character_updates: list[CharacterStateUpdate] | None = None,
-    ) -> None:
+        operation: str | None = None,
+        actor: str = "runtime",
+        branch_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> list[RevisionInfo] | None:
         updates = list(character_updates or [])
         ids = [item.character_id for item in updates]
         if len(ids) != len(set(ids)):
@@ -52,6 +57,11 @@ class StateMutationService:
                 raise CampaignNotFoundError(campaign_id)
 
             rows: list[tuple[Character, CharacterStateUpdate]] = []
+            before_campaign = {
+                "state": dict(campaign.state),
+                "revision": campaign.revision,
+            }
+            before_characters: dict[str, dict[str, Any]] = {}
             for update in updates:
                 row = session.get(Character, update.character_id)
                 if row is None:
@@ -63,6 +73,14 @@ class StateMutationService:
                     and row.revision != update.expected_revision
                 ):
                     raise ValueError(f"character revision conflict: {update.character_id}")
+                before_characters[row.id] = {
+                    "name": row.name,
+                    "player_name": row.player_name,
+                    "summary": row.summary,
+                    "sheet": dict(row.sheet),
+                    "notes": dict(row.notes),
+                    "revision": row.revision,
+                }
                 rows.append((row, update))
 
             if campaign_state is not None:
@@ -73,3 +91,43 @@ class StateMutationService:
                 row.notes = dict(update.notes)
                 row.revision += 1
             session.flush()
+            if operation is None:
+                return None
+            changes: list[dict[str, Any]] = []
+            if campaign_state is not None:
+                changes.append(
+                    {
+                        "entity_type": "campaign",
+                        "entity_id": campaign_id,
+                        "before": before_campaign,
+                        "after": {
+                            "state": dict(campaign.state),
+                            "revision": campaign.revision,
+                        },
+                    }
+                )
+            for row, _update in rows:
+                changes.append(
+                    {
+                        "entity_type": "character",
+                        "entity_id": row.id,
+                        "before": before_characters[row.id],
+                        "after": {
+                            "name": row.name,
+                            "player_name": row.player_name,
+                            "summary": row.summary,
+                            "sheet": dict(row.sheet),
+                            "notes": dict(row.notes),
+                            "revision": row.revision,
+                        },
+                    }
+                )
+            return RevisionService(self.database).record_group_in_session(
+                session,
+                campaign_id,
+                operation=operation,
+                changes=changes,
+                actor=actor,
+                branch_id=branch_id,
+                idempotency_key=idempotency_key,
+            )

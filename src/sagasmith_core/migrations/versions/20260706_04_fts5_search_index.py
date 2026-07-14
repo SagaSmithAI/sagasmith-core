@@ -89,7 +89,10 @@ def _module_select(prefix: str) -> list[str]:
         "COALESCE(msc.title, '')",
         "COALESCE((SELECT GROUP_CONCAT(value, ' ') FROM json_each(msc.headings)), '')",
         "COALESCE((SELECT GROUP_CONCAT(value, ' ') FROM json_each(msc.keywords)), '')",
-        "COALESCE((SELECT GROUP_CONCAT(value, ' ') FROM json_each(json_extract(msc.metadata_json, '$.tags'))), '')",
+        (
+            "COALESCE((SELECT GROUP_CONCAT(value, ' ') FROM "
+            "json_each(json_extract(msc.metadata_json, '$.tags'))), '')"
+        ),
         "COALESCE(msc.scene_type, '')",
         f"COALESCE({p}.chunk_type, '')",
         f"COALESCE({p}.content, '')",

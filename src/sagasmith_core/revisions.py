@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 
 from sagasmith_core.campaigns import CampaignNotFoundError
 from sagasmith_core.database import Database
-from sagasmith_core.models import AuditLog, Campaign, Character, StateRevision
+from sagasmith_core.models import AuditLog, Campaign, Character, MutationGroup, StateRevision
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,7 @@ class RevisionInfo:
     entity_id: str
     applied: bool
     redoable: bool
+    mutation_group_id: str | None = None
 
 
 class RevisionService:
@@ -41,47 +42,128 @@ class RevisionService:
         after: dict[str, Any] | None,
         actor: str = "runtime",
     ) -> RevisionInfo:
+        return self.record_group(
+            campaign_id,
+            operation=operation,
+            changes=[
+                {
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "before": before,
+                    "after": after,
+                }
+            ],
+            actor=actor,
+        )[0]
+
+    def record_group(
+        self,
+        campaign_id: str,
+        *,
+        operation: str,
+        changes: list[dict[str, Any]],
+        actor: str = "runtime",
+        branch_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_hash: str | None = None,
+    ) -> list[RevisionInfo]:
+        """Record one user-visible mutation touching one or many entities."""
         with self.database.transaction() as session:
-            if session.get(Campaign, campaign_id) is None:
-                raise CampaignNotFoundError(campaign_id)
-            current = session.scalar(
-                select(StateRevision)
-                .where(
-                    StateRevision.campaign_id == campaign_id,
-                    StateRevision.applied.is_(True),
-                )
-                .order_by(StateRevision.sequence.desc())
+            return self.record_group_in_session(
+                session,
+                campaign_id,
+                operation=operation,
+                changes=changes,
+                actor=actor,
+                branch_id=branch_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
             )
-            sequence = (
-                session.scalar(
-                    select(func.max(StateRevision.sequence)).where(
-                        StateRevision.campaign_id == campaign_id
-                    )
-                )
-                or 0
-            ) + 1
-            branch_key = (
-                current.branch_key
-                if current is not None and not self._has_redo(session, campaign_id)
-                else str(uuid.uuid4())
+
+    def record_group_in_session(
+        self,
+        session,
+        campaign_id: str,
+        *,
+        operation: str,
+        changes: list[dict[str, Any]],
+        actor: str = "runtime",
+        branch_id: str | None = None,
+        idempotency_key: str | None = None,
+        request_hash: str | None = None,
+    ) -> list[RevisionInfo]:
+        """Record a group inside an existing state transaction."""
+        if not changes:
+            raise ValueError("mutation group must contain at least one change")
+        campaign = session.get(Campaign, campaign_id)
+        if campaign is None:
+            raise CampaignNotFoundError(campaign_id)
+        current = session.scalar(
+            select(StateRevision)
+            .where(
+                StateRevision.campaign_id == campaign_id,
+                StateRevision.applied.is_(True),
             )
+            .order_by(StateRevision.sequence.desc())
+        )
+        max_sequence = (
+            session.scalar(
+                select(func.max(StateRevision.sequence)).where(
+                    StateRevision.campaign_id == campaign_id
+                )
+            )
+            or 0
+        )
+        group = MutationGroup(
+            id=str(uuid.uuid4()),
+            campaign_id=campaign_id,
+            branch_id=branch_id or campaign.active_branch_id,
+            sequence=max_sequence + 1,
+            operation=operation,
+            actor=actor,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
+        session.add(group)
+        if self._has_redo(session, campaign_id):
+            session.query(MutationGroup).filter(
+                MutationGroup.campaign_id == campaign_id,
+                MutationGroup.applied.is_(False),
+                MutationGroup.redoable.is_(True),
+            ).update({MutationGroup.redoable: False}, synchronize_session=False)
+            session.query(StateRevision).filter(
+                StateRevision.campaign_id == campaign_id,
+                StateRevision.applied.is_(False),
+                StateRevision.redoable.is_(True),
+            ).update({StateRevision.redoable: False}, synchronize_session=False)
+        branch_key = (
+            current.branch_key
+            if current is not None and not self._has_redo(session, campaign_id)
+            else str(uuid.uuid4())
+        )
+        rows: list[StateRevision] = []
+        parent_id = current.id if current else None
+        for offset, change in enumerate(changes):
             row = StateRevision(
                 id=str(uuid.uuid4()),
+                mutation_group_id=group.id,
                 campaign_id=campaign_id,
-                parent_id=current.id if current else None,
-                sequence=sequence,
+                parent_id=parent_id,
+                sequence=max_sequence + offset + 1,
                 branch_key=branch_key,
                 operation=operation,
-                entity_type=entity_type,
-                entity_id=entity_id,
-                before=before,
-                after=after,
+                entity_type=str(change["entity_type"]),
+                entity_id=str(change["entity_id"]),
+                before=change.get("before"),
+                after=change.get("after"),
             )
             session.add(row)
             session.flush()
             self._audit(session, row, actor=actor)
-            session.flush()
-            return self._info(row)
+            rows.append(row)
+            parent_id = row.id
+        session.flush()
+        return [self._info(row) for row in rows]
 
     def undo(self, campaign_id: str) -> RevisionInfo:
         with self.database.transaction() as session:
@@ -95,9 +177,15 @@ class RevisionService:
             )
             if row is None:
                 raise LookupError("nothing to undo")
-            self._apply(session, row, row.before)
-            row.applied = False
-            self._audit(session, row, actor="undo", reverse=True)
+            rows = self._group_rows(session, row)
+            for member in sorted(rows, key=lambda item: item.sequence, reverse=True):
+                self._apply(session, member, member.before)
+                member.applied = False
+                self._audit(session, member, actor="undo", reverse=True)
+            if row.mutation_group_id:
+                group = session.get(MutationGroup, row.mutation_group_id)
+                if group is not None:
+                    group.applied = False
             session.flush()
             return self._info(row)
 
@@ -111,21 +199,47 @@ class RevisionService:
                 )
                 .order_by(StateRevision.sequence.desc())
             )
-            statement = select(StateRevision).where(
-                StateRevision.campaign_id == campaign_id,
-                StateRevision.applied.is_(False),
-                StateRevision.redoable.is_(True),
+            current_group_id = current.mutation_group_id if current else None
+            statement = select(MutationGroup).where(
+                MutationGroup.campaign_id == campaign_id,
+                MutationGroup.applied.is_(False),
+                MutationGroup.redoable.is_(True),
             )
-            if current:
-                statement = statement.where(StateRevision.parent_id == current.id)
-            else:
-                statement = statement.where(StateRevision.parent_id.is_(None))
-            row = session.scalar(statement.order_by(StateRevision.sequence))
-            if row is None:
-                raise LookupError("nothing to redo")
-            self._apply(session, row, row.after)
-            row.applied = True
-            self._audit(session, row, actor="redo")
+            if current_group_id:
+                current_sequence = (
+                    select(MutationGroup.sequence)
+                    .where(MutationGroup.id == current_group_id)
+                    .scalar_subquery()
+                )
+                statement = statement.where(MutationGroup.sequence > current_sequence)
+            group = session.scalar(statement.order_by(MutationGroup.sequence))
+            if group is None:
+                # Legacy single revisions, created before grouped revisions, remain redoable.
+                legacy = select(StateRevision).where(
+                    StateRevision.campaign_id == campaign_id,
+                    StateRevision.mutation_group_id.is_(None),
+                    StateRevision.applied.is_(False),
+                    StateRevision.redoable.is_(True),
+                )
+                if current:
+                    legacy = legacy.where(StateRevision.parent_id == current.id)
+                else:
+                    legacy = legacy.where(StateRevision.parent_id.is_(None))
+                row = session.scalar(legacy.order_by(StateRevision.sequence))
+                if row is None:
+                    raise LookupError("nothing to redo")
+                self._apply(session, row, row.after)
+                row.applied = True
+                self._audit(session, row, actor="redo")
+                session.flush()
+                return self._info(row)
+            rows = self._group_rows(session, group_id=group.id)
+            for member in sorted(rows, key=lambda item: item.sequence):
+                self._apply(session, member, member.after)
+                member.applied = True
+                self._audit(session, member, actor="redo")
+            group.applied = True
+            row = rows[-1]
             session.flush()
             return self._info(row)
 
@@ -144,12 +258,30 @@ class RevisionService:
         return bool(
             session.scalar(
                 select(func.count())
-                .select_from(StateRevision)
+                .select_from(MutationGroup)
                 .where(
-                    StateRevision.campaign_id == campaign_id,
-                    StateRevision.applied.is_(False),
-                    StateRevision.redoable.is_(True),
+                    MutationGroup.campaign_id == campaign_id,
+                    MutationGroup.applied.is_(False),
+                    MutationGroup.redoable.is_(True),
                 )
+            )
+        )
+
+    @staticmethod
+    def _group_rows(
+        session,
+        row: StateRevision | None = None,
+        *,
+        group_id: str | None = None,
+    ) -> list[StateRevision]:
+        target = group_id or (row.mutation_group_id if row is not None else None)
+        if target is None and row is not None:
+            return [row]
+        return list(
+            session.scalars(
+                select(StateRevision)
+                .where(StateRevision.mutation_group_id == target)
+                .order_by(StateRevision.sequence)
             )
         )
 
@@ -196,4 +328,5 @@ class RevisionService:
             entity_id=row.entity_id,
             applied=row.applied,
             redoable=row.redoable,
+            mutation_group_id=row.mutation_group_id,
         )

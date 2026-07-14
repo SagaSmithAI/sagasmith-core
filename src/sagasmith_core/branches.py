@@ -89,6 +89,67 @@ class BranchService:
                 raise LookupError(branch_id)
             return self._info(row)
 
+    def compare(
+        self, campaign_id: str, left_branch_id: str, right_branch_id: str
+    ) -> dict[str, object]:
+        """Compare branch heads without silently merging subjective knowledge."""
+        with self.database.transaction() as session:
+            if session.get(Campaign, campaign_id) is None:
+                raise CampaignNotFoundError(campaign_id)
+            left = session.get(CampaignBranch, left_branch_id)
+            right = session.get(CampaignBranch, right_branch_id)
+            if (
+                left is None
+                or right is None
+                or left.campaign_id != campaign_id
+                or right.campaign_id != campaign_id
+            ):
+                raise LookupError("branch does not belong to campaign")
+            left_facts = {
+                row.memory_id: row.revision_id
+                for row in session.scalars(
+                    select(BranchFactHead).where(BranchFactHead.branch_id == left.id)
+                )
+            }
+            right_facts = {
+                row.memory_id: row.revision_id
+                for row in session.scalars(
+                    select(BranchFactHead).where(BranchFactHead.branch_id == right.id)
+                )
+            }
+            left_knowledge = {
+                row.knowledge_id: row.revision_id
+                for row in session.scalars(
+                    select(BranchActorKnowledgeHead).where(
+                        BranchActorKnowledgeHead.branch_id == left.id
+                    )
+                )
+            }
+            right_knowledge = {
+                row.knowledge_id: row.revision_id
+                for row in session.scalars(
+                    select(BranchActorKnowledgeHead).where(
+                        BranchActorKnowledgeHead.branch_id == right.id
+                    )
+                )
+            }
+            return {
+                "campaign_id": campaign_id,
+                "left_branch_id": left.id,
+                "right_branch_id": right.id,
+                "facts": self._diff_ids(left_facts, right_facts),
+                "actor_knowledge": self._diff_ids(left_knowledge, right_knowledge),
+                "merge_policy": "explicit-per-fact-and-actor-knowledge",
+            }
+
+    @staticmethod
+    def _diff_ids(left: dict[str, str], right: dict[str, str]) -> dict[str, list[str]]:
+        return {
+            "left_only": sorted(set(left) - set(right)),
+            "right_only": sorted(set(right) - set(left)),
+            "changed": sorted(key for key in set(left) & set(right) if left[key] != right[key]),
+        }
+
     def create(
         self,
         campaign_id: str,

@@ -189,11 +189,14 @@ class CharacterService:
         summary: str | None = None,
         sheet: dict[str, Any] | None = None,
         notes: dict[str, Any] | None = None,
+        expected_revision: int | None = None,
     ) -> CharacterInfo:
         with self.database.transaction() as session:
             row = session.get(Character, character_id)
             if row is None:
                 raise CharacterNotFoundError(character_id)
+            if expected_revision is not None and row.revision != expected_revision:
+                raise ValueError(f"character revision conflict: {character_id}")
             if name is not None:
                 row.name = name
             if player_name is not None:

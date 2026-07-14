@@ -327,6 +327,9 @@ class StateRevision(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    mutation_group_id: Mapped[str | None] = mapped_column(
+        ForeignKey("mutation_groups.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     campaign_id: Mapped[str] = mapped_column(
         ForeignKey("campaigns.id", ondelete="CASCADE"),
         index=True,
@@ -344,6 +347,106 @@ class StateRevision(Base):
     after: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     applied: Mapped[bool] = mapped_column(Boolean, default=True)
     redoable: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class MutationGroup(Base):
+    """One user-visible state mutation, possibly touching many entities."""
+
+    __tablename__ = "mutation_groups"
+    __table_args__ = (Index("ix_mutation_group_campaign_sequence", "campaign_id", "sequence"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(
+        ForeignKey("campaigns.id", ondelete="CASCADE"), index=True
+    )
+    branch_id: Mapped[str | None] = mapped_column(
+        ForeignKey("campaign_branches.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    operation: Mapped[str] = mapped_column(String(100), nullable=False)
+    actor: Mapped[str] = mapped_column(String(100), default="runtime")
+    idempotency_key: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    applied: Mapped[bool] = mapped_column(Boolean, default=True)
+    redoable: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class IdempotencyRecord(Base):
+    """Stable result of a retriable MCP write request."""
+
+    __tablename__ = "idempotency_records"
+    __table_args__ = (
+        UniqueConstraint("scope", "key", name="uq_idempotency_scope_key"),
+        Index("ix_idempotency_campaign", "campaign_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    scope: Mapped[str] = mapped_column(String(200), nullable=False)
+    key: Mapped[str] = mapped_column(String(200), nullable=False)
+    campaign_id: Mapped[str | None] = mapped_column(
+        ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    mutation_group_id: Mapped[str | None] = mapped_column(
+        ForeignKey("mutation_groups.id", ondelete="SET NULL"), nullable=True
+    )
+    response: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Principal(Base):
+    """An external platform identity resolved by the MCP boundary."""
+
+    __tablename__ = "principals"
+    __table_args__ = (
+        UniqueConstraint("platform", "external_id", name="uq_principal_platform_external"),
+    )
+
+    id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    platform: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(200), default="")
+    is_service: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CampaignMembership(Base):
+    """Campaign-level access; role is resolved server-side, never trusted from prompts."""
+
+    __tablename__ = "campaign_memberships"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "principal_id", name="uq_campaign_membership"),
+    )
+
+    campaign_id: Mapped[str] = mapped_column(
+        ForeignKey("campaigns.id", ondelete="CASCADE"), primary_key=True
+    )
+    principal_id: Mapped[str] = mapped_column(
+        ForeignKey("principals.id", ondelete="CASCADE"), primary_key=True
+    )
+    role: Mapped[str] = mapped_column(String(32), default="player")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ActorGrant(Base):
+    """Explicit control/view grants from a real user to a PC or NPC actor."""
+
+    __tablename__ = "actor_grants"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "principal_id", "actor_id", name="uq_actor_grant"),
+    )
+
+    campaign_id: Mapped[str] = mapped_column(
+        ForeignKey("campaigns.id", ondelete="CASCADE"), primary_key=True
+    )
+    principal_id: Mapped[str] = mapped_column(
+        ForeignKey("principals.id", ondelete="CASCADE"), primary_key=True
+    )
+    actor_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    can_control: Mapped[bool] = mapped_column(Boolean, default=False)
+    can_view_private: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

@@ -178,6 +178,26 @@ class ActorKnowledgeService:
             )
             return [self._info(*row) for row in rows]
 
+    def get(self, knowledge_id: str, *, branch_id: str | None = None) -> ActorKnowledgeInfo:
+        with self.database.transaction() as session:
+            knowledge = session.get(ActorKnowledge, knowledge_id)
+            if knowledge is None:
+                raise LookupError(knowledge_id)
+            campaign = session.get(Campaign, knowledge.campaign_id)
+            if campaign is None:
+                raise CampaignNotFoundError(knowledge.campaign_id)
+            branch = resolve_branch(session, campaign, branch_id)
+            head = session.get(
+                BranchActorKnowledgeHead,
+                {"branch_id": branch.id, "knowledge_id": knowledge.id},
+            )
+            if head is None:
+                raise LookupError(knowledge_id)
+            revision = session.get(ActorKnowledgeRevision, head.revision_id)
+            if revision is None:
+                raise LookupError(head.revision_id)
+            return self._info(knowledge, revision)
+
     def search(
         self,
         campaign_id: str,
