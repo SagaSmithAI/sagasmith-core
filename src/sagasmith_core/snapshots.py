@@ -396,6 +396,7 @@ class SnapshotService:
                     "status": row.status,
                     "progress": row.progress,
                     "current_room": row.current_room,
+                    "current_location_key": row.current_location_key,
                     "state_version": row.state_version,
                     "state": dict(row.state),
                 }
@@ -607,6 +608,7 @@ class SnapshotService:
         session.execute(delete(SceneProgress).where(SceneProgress.campaign_id == campaign.id))
         for item in payload.get("scene_progress", []):
             item.setdefault("scope_id", "party")
+            item.setdefault("current_location_key", None)
             session.add(SceneProgress(campaign_id=campaign.id, **item))
 
         # Events, campaign facts, and actor knowledge are immutable ledgers.  Their

@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from sagasmith_core.campaigns import CampaignNotFoundError
 from sagasmith_core.database import Database
@@ -95,9 +95,7 @@ class GenericModuleProfile:
             return "table"
         if text.lstrip().startswith(">"):
             return "read_aloud"
-        if lines and sum(
-            line.lstrip().startswith(("-", "*")) for line in lines
-        ) >= len(lines) / 2:
+        if lines and sum(line.lstrip().startswith(("-", "*")) for line in lines) >= len(lines) / 2:
             return "list"
         if heading.casefold() in {"appendix", "附录", "reference", "参考"}:
             return "reference"
@@ -114,8 +112,7 @@ class GenericModuleProfile:
     ) -> list[SceneBoundary]:
         matches = list(re.finditer(r"^(#{2,4})\s+(.+?)\s*$", chapter_content, re.MULTILINE))
         counts = {
-            level: sum(len(match.group(1)) == level for match in matches)
-            for level in (2, 3, 4)
+            level: sum(len(match.group(1)) == level for match in matches) for level in (2, 3, 4)
         }
         if counts[2] and counts[3] >= counts[2] * 5:
             scene_level = 3
@@ -125,9 +122,7 @@ class GenericModuleProfile:
             scene_level = 3
         else:
             scene_level = 4
-        scene_headings = [
-            match for match in matches if len(match.group(1)) == scene_level
-        ]
+        scene_headings = [match for match in matches if len(match.group(1)) == scene_level]
         if not scene_headings:
             return [SceneBoundary(chapter_title, 0, len(chapter_content))]
         return [
@@ -163,9 +158,7 @@ class MarkdownModuleParser:
         if not headings:
             return [self._chapter(0, "Document", content, 0, len(content))]
         chapter_starts = [
-            (index, match)
-            for index, match in enumerate(headings)
-            if len(match.group(1)) == 1
+            (index, match) for index, match in enumerate(headings) if len(match.group(1)) == 1
         ]
         if not chapter_starts:
             chapter_starts = [(0, headings[0])]
@@ -216,8 +209,7 @@ class MarkdownModuleParser:
                         **chunk.metadata,
                         "start_line": chapter_content.count("\n", 0, start + chunk.start_offset)
                         + 1,
-                        "end_line": chapter_content.count("\n", 0, start + chunk.end_offset)
-                        + 1,
+                        "end_line": chapter_content.count("\n", 0, start + chunk.end_offset) + 1,
                         "page_start": page_for_offset(chapter_content, start + chunk.start_offset),
                         "page_end": page_for_offset(chapter_content, start + chunk.end_offset),
                         "chunk_type": self.profile.classify_chunk(section.title, text),
@@ -314,7 +306,14 @@ class ModuleService:
                 counts = self._counts(session, existing.id)
                 return ModuleIngestResult(existing.id, True, *counts, 0)
             if existing:
-                session.execute(delete(ModuleSource).where(ModuleSource.id == existing.id))
+                # Module text is external to save payloads, but scene progress
+                # and historical snapshots hold foreign keys to its scene rows.
+                # Retire the old source instead of deleting it: a restore must
+                # always be able to resolve the exact scene it captured.
+                existing.active = False
+                existing.source_key = self._retired_source_key(
+                    session, campaign_id, source_key, existing.checksum
+                )
                 session.flush()
 
             module_id = str(uuid.uuid4())
@@ -529,20 +528,15 @@ class ModuleService:
             "metadata": dict(document.metadata),
             "chapters": len(parsed),
             "scenes": sum(len(chapter.scenes) for chapter in parsed),
-            "chunks": sum(
-                len(scene.chunks)
-                for chapter in parsed
-                for scene in chapter.scenes
-            ),
+            "chunks": sum(len(scene.chunks) for chapter in parsed for scene in chapter.scenes),
         }
 
-    def list(self, campaign_id: str) -> list[dict[str, Any]]:
+    def list(self, campaign_id: str, *, include_retired: bool = False) -> list[dict[str, Any]]:
         with self.database.transaction() as session:
-            rows = session.scalars(
-                select(ModuleSource)
-                .where(ModuleSource.campaign_id == campaign_id)
-                .order_by(ModuleSource.title, ModuleSource.id)
-            )
+            statement = select(ModuleSource).where(ModuleSource.campaign_id == campaign_id)
+            if not include_retired:
+                statement = statement.where(ModuleSource.active.is_(True))
+            rows = session.scalars(statement.order_by(ModuleSource.title, ModuleSource.id))
             return [
                 {
                     "id": row.id,
@@ -615,6 +609,7 @@ class ModuleService:
                 "page_end": row.ModuleScene.page_end,
                 "chapter": row.ModuleChapter.title,
                 "module": row.ModuleSource.title,
+                "module_id": row.ModuleSource.id,
                 "start_line": row.ModuleScene.start_line,
                 "end_line": row.ModuleScene.end_line,
                 "keywords": list(row.ModuleScene.keywords),
@@ -634,6 +629,7 @@ class ModuleService:
                 .join(ModuleChapter, ModuleChapter.id == ModuleScene.chapter_id)
                 .join(ModuleSource, ModuleSource.id == ModuleScene.module_id)
                 .where(ModuleSource.campaign_id == campaign_id)
+                .where(ModuleSource.active.is_(True))
                 .order_by(ModuleChapter.ordinal, ModuleScene.ordinal, ModuleScene.id)
             )
             if module_id:
@@ -678,7 +674,6 @@ class ModuleService:
                         SceneProgress.campaign_id == campaign_id,
                         SceneProgress.scope_id == effective_scope,
                         SceneProgress.status == "current",
-                        ModuleSource.active.is_(True),
                     )
                     .order_by(SceneProgress.updated_at.desc(), SceneProgress.id.desc())
                 ).first()
@@ -707,6 +702,7 @@ class ModuleService:
                     "status": row.SceneProgress.status,
                     "percent": row.SceneProgress.progress,
                     "current_room": row.SceneProgress.current_room,
+                    "current_location_key": row.SceneProgress.current_location_key,
                     "state_version": row.SceneProgress.state_version,
                     "state": dict(row.SceneProgress.state),
                 },
@@ -776,24 +772,27 @@ class ModuleService:
         fts_ids: list[str] = []
         with self.database.transaction() as session:
             fts_ids = fts5_hits(
-                session, "module_fts", enriched,
+                session,
+                "module_fts",
+                enriched,
                 limit=max(top_k * 4, 20),
                 weights=(
-                    0.0,   # chunk_id UNINDEXED
-                    8.0,   # module_title
-                    6.0,   # chapter_title
-                    4.0,   # scene_title
-                    3.0,   # headings
-                    2.5,   # keywords
-                    2.0,   # tags
-                    2.0,   # scene_type
-                    1.5,   # chunk_type
-                    1.0,   # content
+                    0.0,  # chunk_id UNINDEXED
+                    8.0,  # module_title
+                    6.0,  # chapter_title
+                    4.0,  # scene_title
+                    3.0,  # headings
+                    2.5,  # keywords
+                    2.0,  # tags
+                    2.0,  # scene_type
+                    1.5,  # chunk_type
+                    1.0,  # content
                 ),
             )
             if fts_ids:
                 fts_filtered = [
-                    chunk_id for chunk_id in fts_ids
+                    chunk_id
+                    for chunk_id in fts_ids
                     if chunk_id in {row.ModuleChunk.id for row in rows}
                 ]
                 fts_ids = fts_filtered
@@ -803,19 +802,22 @@ class ModuleService:
         else:
             # Fallback: Python-side structured_score when FTS5 unavailable
             lexical = [
-                row.ModuleChunk.id for row in sorted(
+                row.ModuleChunk.id
+                for row in sorted(
                     rows,
-                    key=lambda row: -structured_score(
-                        enriched,
-                        module_title=row.ModuleSource.title,
-                        chapter_title=row.ModuleChapter.title,
-                        scene_title=row.ModuleScene.title,
-                        heading_paths=" ".join(row.ModuleScene.headings or []),
-                        keywords=" ".join(row.ModuleScene.keywords or []),
-                        tags=" ".join(row.ModuleScene.metadata_json.get("tags", [])),
-                        scene_type=row.ModuleScene.scene_type,
-                        chunk_type=row.ModuleChunk.chunk_type,
-                        content=row.ModuleChunk.content,
+                    key=lambda row: (
+                        -structured_score(
+                            enriched,
+                            module_title=row.ModuleSource.title,
+                            chapter_title=row.ModuleChapter.title,
+                            scene_title=row.ModuleScene.title,
+                            heading_paths=" ".join(row.ModuleScene.headings or []),
+                            keywords=" ".join(row.ModuleScene.keywords or []),
+                            tags=" ".join(row.ModuleScene.metadata_json.get("tags", [])),
+                            scene_type=row.ModuleScene.scene_type,
+                            chunk_type=row.ModuleChunk.chunk_type,
+                            content=row.ModuleChunk.content,
+                        )
                     ),
                 )
             ]
@@ -892,6 +894,7 @@ class ModuleService:
         progress: int = 0,
         state: dict[str, Any] | None = None,
         current_room: str | None = None,
+        current_location_key: str | None = None,
         scope_id: str = "party",
         expected_state_version: int | None = None,
     ) -> dict[str, Any]:
@@ -922,10 +925,7 @@ class ModuleService:
                     scope_id=scope_id,
                 )
                 session.add(row)
-            elif (
-                expected_state_version is not None
-                and row.state_version != expected_state_version
-            ):
+            elif expected_state_version is not None and row.state_version != expected_state_version:
                 raise ValueError(
                     f"scene progress conflict: expected {expected_state_version}, "
                     f"found {row.state_version}"
@@ -944,6 +944,17 @@ class ModuleService:
             row.progress = progress
             if current_room is not None:
                 row.current_room = current_room
+            if current_location_key is not None:
+                locations = {
+                    str(item.get("key"))
+                    for item in dict(scene.metadata_json or {})
+                    .get("spatial", {})
+                    .get("locations", [])
+                    if isinstance(item, dict) and item.get("key")
+                }
+                if locations and current_location_key not in locations:
+                    raise ValueError("current_location_key is not a location in this scene")
+                row.current_location_key = current_location_key
             row.state_version = (row.state_version or 0) + 1
             if state is not None:
                 row.state = state
@@ -956,6 +967,7 @@ class ModuleService:
                 "status": row.status,
                 "progress": row.progress,
                 "current_room": row.current_room,
+                "current_location_key": row.current_location_key,
                 "state_version": row.state_version,
                 "state": dict(row.state),
             }
@@ -993,7 +1005,27 @@ class ModuleService:
             "sanity": list(metadata.get("sanity", [])),
             "transitions": list(metadata.get("transitions", [])),
             "node_id": metadata.get("node_id"),
+            "spatial": dict(metadata.get("spatial") or {}),
         }
+
+    @staticmethod
+    def _retired_source_key(session: Any, campaign_id: str, source_key: str, checksum: str) -> str:
+        """Return a unique, human-auditable key for an immutable retired revision."""
+        # ModuleSource.source_key is capped at 200 characters. Reserve room for
+        # the checksum and a collision suffix when a very long filename is
+        # revised multiple times.
+        stem = f"{source_key[:180]}@{checksum[:12]}"
+        candidate = stem
+        suffix = 2
+        while session.scalar(
+            select(ModuleSource.id).where(
+                ModuleSource.campaign_id == campaign_id,
+                ModuleSource.source_key == candidate,
+            )
+        ):
+            candidate = f"{stem[: 200 - len(str(suffix)) - 1]}-{suffix}"
+            suffix += 1
+        return candidate
 
     @staticmethod
     def _counts(session, module_id: str) -> tuple[int, int, int]:

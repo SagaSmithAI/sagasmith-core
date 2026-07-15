@@ -1,5 +1,6 @@
 from sagasmith_core.campaigns import CampaignService
 from sagasmith_core.modules import ModuleService
+from sagasmith_core.snapshots import SnapshotService
 
 
 def test_module_ingest_search_and_progress(database) -> None:
@@ -63,11 +64,47 @@ def test_module_ingest_search_and_progress(database) -> None:
         state={"discovered": ["wolf tracks"]},
     )
     assert scoped["scope_id"] == "player:alice"
-    assert service.current_scene(
-        campaign.id,
-        scope_id="player:alice",
-    )["title"] == "Broken Gate"
+    assert (
+        service.current_scene(
+            campaign.id,
+            scope_id="player:alice",
+        )["title"]
+        == "Broken Gate"
+    )
     inherited = service.current_scene(campaign.id, scope_id="player:bob")
     assert inherited["title"] == "Inner Hall"
     assert inherited["inherited_from_party"] is True
     assert service.current_scene(campaign.id)["title"] == "Inner Hall"
+
+
+def test_module_reimport_preserves_snapshot_scene_references(database) -> None:
+    campaign = CampaignService(database).create(system_id="dnd5e", name="Revision")
+    modules = ModuleService(database)
+    modules.ingest(
+        campaign_id=campaign.id,
+        source_key="keep.md",
+        title="The Keep",
+        content="# Chapter\n## Gate\nThe original gate.",
+    )
+    original = modules.scene_index(campaign.id)[0]
+    modules.set_scene_progress(
+        campaign_id=campaign.id,
+        scene_id=original["scene_id"],
+        current_location_key="gate",
+        state={"door": "closed"},
+    )
+    snapshot = SnapshotService(database).create(campaign.id, label="Before revision")
+
+    modules.ingest(
+        campaign_id=campaign.id,
+        source_key="keep.md",
+        title="The Keep",
+        content="# Chapter\n## Courtyard\nThe revised entry.",
+    )
+
+    assert [item["title"] for item in modules.scene_index(campaign.id)] == ["Courtyard"]
+    assert modules.current_scene(campaign.id)["title"] == "Gate"
+    assert modules.current_scene(campaign.id)["progress"]["current_location_key"] == "gate"
+    restored = SnapshotService(database).restore(campaign.id, snapshot.slot)
+    assert restored.parent_id == snapshot.id
+    assert modules.current_scene(campaign.id)["title"] == "Gate"

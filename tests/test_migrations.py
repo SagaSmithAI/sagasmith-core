@@ -13,15 +13,12 @@ def test_bundled_migration_builds_schema(tmp_path: Path) -> None:
         inspector = inspect(database.engine)
         assert "campaigns" in inspector.get_table_names()
         assert "alembic_version" in inspector.get_table_names()
-        assert "scope_id" in {
+        assert "scope_id" in {column["name"] for column in inspector.get_columns("scene_progress")}
+        assert "current_location_key" in {
             column["name"] for column in inspector.get_columns("scene_progress")
         }
-        assert "redoable" in {
-            column["name"] for column in inspector.get_columns("state_revisions")
-        }
-        assert "template_id" in {
-            column["name"] for column in inspector.get_columns("characters")
-        }
+        assert "redoable" in {column["name"] for column in inspector.get_columns("state_revisions")}
+        assert "template_id" in {column["name"] for column in inspector.get_columns("characters")}
         assert "rule_pack_versions" in inspector.get_table_names()
         assert "campaign_rule_activations" in inspector.get_table_names()
         assert "rule_resolution_receipts" in inspector.get_table_names()
@@ -67,6 +64,7 @@ def test_scoped_progress_migrates_existing_sqlite_schema(tmp_path: Path) -> None
                 "SELECT scope_id FROM scene_progress WHERE id = 'progress-1'"
             ).scalar_one()
         assert "scope_id" in columns
+        assert "current_location_key" in columns
         assert scope == "party"
         assert any(
             constraint["column_names"] == ["campaign_id", "scope_id", "scene_id"]
@@ -144,8 +142,7 @@ def test_branch_continuity_does_not_backfill_existing_campaigns(tmp_path: Path) 
                 "SELECT active_branch_id FROM campaigns WHERE id = 'legacy-campaign'"
             ).scalar_one()
             branch_count = connection.exec_driver_sql(
-                "SELECT COUNT(*) FROM campaign_branches "
-                "WHERE campaign_id = 'legacy-campaign'"
+                "SELECT COUNT(*) FROM campaign_branches WHERE campaign_id = 'legacy-campaign'"
             ).scalar_one()
         assert active_branch_id is None
         assert branch_count == 0

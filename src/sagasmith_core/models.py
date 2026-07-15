@@ -276,6 +276,10 @@ class SceneProgress(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(32), default="current")
     progress: Mapped[int] = mapped_column(Integer, default=0)
     current_room: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # ``current_room`` is retained as a human-readable compatibility field.  A
+    # profile may additionally provide a stable spatial location key so room
+    # renames do not break branch-local progress or a temporary battle map.
+    current_location_key: Mapped[str | None] = mapped_column(String(300), nullable=True)
     state_version: Mapped[int] = mapped_column(Integer, default=1)
     state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
