@@ -289,9 +289,13 @@ class ModuleService:
         vector_store: VectorStore | None = None,
         source_path: str = "",
         normalized_document: NormalizedDocument | None = None,
+        activate: bool = True,
+        logical_source_key: str | None = None,
     ) -> ModuleIngestResult:
         checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
         parsed = (parser or MarkdownModuleParser()).parse(content)
+        logical_key = logical_source_key or source_key
+        stored_source_key = source_key if activate else f"{logical_key}--staged-{checksum[:12]}"
         with self.database.transaction() as session:
             campaign = session.get(Campaign, campaign_id)
             if campaign is None:
@@ -299,20 +303,20 @@ class ModuleService:
             existing = session.scalar(
                 select(ModuleSource).where(
                     ModuleSource.campaign_id == campaign_id,
-                    ModuleSource.source_key == source_key,
+                    ModuleSource.source_key == stored_source_key,
                 )
             )
             if existing and existing.checksum == checksum:
                 counts = self._counts(session, existing.id)
                 return ModuleIngestResult(existing.id, True, *counts, 0)
-            if existing:
+            if existing and activate:
                 # Module text is external to save payloads, but scene progress
                 # and historical snapshots hold foreign keys to its scene rows.
                 # Retire the old source instead of deleting it: a restore must
                 # always be able to resolve the exact scene it captured.
                 existing.active = False
                 existing.source_key = self._retired_source_key(
-                    session, campaign_id, source_key, existing.checksum
+                    session, campaign_id, stored_source_key, existing.checksum
                 )
                 session.flush()
 
@@ -322,14 +326,19 @@ class ModuleService:
                 id=module_id,
                 system_id=campaign.system_id,
                 campaign_id=campaign_id,
-                source_key=source_key,
+                source_key=stored_source_key,
                 title=title,
                 source_path=source_path,
                 checksum=checksum,
+                active=activate,
                 parser_profile=getattr(profile, "name", "generic"),
                 parser_version=getattr(profile, "version", "1"),
                 warnings=list(normalized_document.warnings) if normalized_document else [],
-                metadata_json=metadata or {},
+                metadata_json={
+                    **dict(metadata or {}),
+                    "logical_source_key": logical_key,
+                    "import_state": "active" if activate else "staged",
+                },
             )
             session.add(source_row)
             session.flush()
@@ -376,6 +385,13 @@ class ModuleService:
                 session.flush()
                 for scene in chapter.scenes:
                     scene_id = str(uuid.uuid4())
+                    scene_metadata = {
+                        **dict(scene.metadata),
+                        "stable_key": self._scene_stable_key(scene.heading_path, scene.title),
+                        "content_checksum": hashlib.sha256(
+                            scene.content.encode("utf-8")
+                        ).hexdigest(),
+                    }
                     session.add(
                         ModuleScene(
                             id=scene_id,
@@ -384,17 +400,17 @@ class ModuleService:
                             ordinal=scene.ordinal,
                             title=scene.title,
                             content=scene.content,
-                            scene_type=scene.metadata.get("scene_type", "section"),
-                            start_line=scene.metadata.get("start_line", 1),
-                            end_line=scene.metadata.get("end_line", 1),
-                            page_start=scene.metadata.get("page_start"),
-                            page_end=scene.metadata.get("page_end"),
-                            headings=scene.metadata.get(
+                            scene_type=scene_metadata.get("scene_type", "section"),
+                            start_line=scene_metadata.get("start_line", 1),
+                            end_line=scene_metadata.get("end_line", 1),
+                            page_start=scene_metadata.get("page_start"),
+                            page_end=scene_metadata.get("page_end"),
+                            headings=scene_metadata.get(
                                 "headings",
                                 list(scene.heading_path),
                             ),
-                            keywords=scene.metadata.get("keywords", []),
-                            metadata_json=scene.metadata,
+                            keywords=scene_metadata.get("keywords", []),
+                            metadata_json=scene_metadata,
                         )
                     )
                     session.flush()
@@ -495,6 +511,8 @@ class ModuleService:
         parser: MarkdownModuleParser | None = None,
         embedder: Embedder | None = None,
         vector_store: VectorStore | None = None,
+        activate: bool = True,
+        logical_source_key: str | None = None,
     ) -> ModuleIngestResult:
         source_path = Path(path).expanduser().resolve()
         document = converter_for(source_path).convert(source_path)
@@ -514,6 +532,8 @@ class ModuleService:
             vector_store=vector_store,
             source_path=str(source_path),
             normalized_document=document,
+            activate=activate,
+            logical_source_key=logical_source_key,
         )
 
     def inspect_path(
@@ -539,6 +559,158 @@ class ModuleService:
             "chunks": sum(len(scene.chunks) for chapter in parsed for scene in chapter.scenes),
         }
 
+    def preview_path(
+        self,
+        path: str | Path,
+        *,
+        parser: MarkdownModuleParser | None = None,
+    ) -> dict[str, Any]:
+        """Parse a module without persistence and expose stable scene/package evidence."""
+        document = converter_for(path).convert(path)
+        selected_parser = parser or MarkdownModuleParser()
+        parsed = selected_parser.parse(document.content)
+        scenes: list[dict[str, Any]] = []
+        errors: list[str] = []
+        keys: set[str] = set()
+        for chapter in parsed:
+            for scene in chapter.scenes:
+                stable_key = self._scene_stable_key(scene.heading_path, scene.title)
+                if stable_key in keys:
+                    errors.append(f"duplicate stable scene key: {stable_key}")
+                keys.add(stable_key)
+                metadata = dict(scene.metadata)
+                spatial = dict(metadata.get("spatial") or {})
+                locations = list(spatial.get("locations") or [])
+                location_keys = [str(item.get("key") or "") for item in locations]
+                if any(not item for item in location_keys):
+                    errors.append(f"scene {stable_key} has a spatial location without a key")
+                if len(location_keys) != len(set(location_keys)):
+                    errors.append(f"scene {stable_key} has duplicate spatial location keys")
+                scenes.append(
+                    {
+                        "stable_key": stable_key,
+                        "chapter": chapter.title,
+                        "chapter_ordinal": chapter.ordinal,
+                        "ordinal": scene.ordinal,
+                        "title": scene.title,
+                        "headings": list(scene.heading_path),
+                        "scene_type": metadata.get("scene_type", "section"),
+                        "visibility": metadata.get("visibility", "keeper"),
+                        "keywords": list(metadata.get("keywords") or []),
+                        "spatial": spatial,
+                        "content_checksum": hashlib.sha256(
+                            scene.content.encode("utf-8")
+                        ).hexdigest(),
+                    }
+                )
+        if not scenes:
+            errors.append("module contains no scenes")
+        return {
+            "source_path": document.source_path,
+            "media_type": document.media_type,
+            "checksum": document.checksum,
+            "page_count": document.page_count,
+            "warnings": list(document.warnings),
+            "metadata": dict(document.metadata),
+            "parser_profile": getattr(selected_parser.profile, "name", "generic"),
+            "parser_version": getattr(selected_parser.profile, "version", "1"),
+            "scenes": scenes,
+            "valid": not errors,
+            "errors": errors,
+        }
+
+    def diff_preview(
+        self,
+        campaign_id: str,
+        *,
+        source_key: str,
+        preview: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Compare a prospective module package against its active logical revision."""
+        with self.database.transaction() as session:
+            sources = list(
+                session.scalars(
+                    select(ModuleSource)
+                    .where(ModuleSource.campaign_id == campaign_id)
+                    .where(ModuleSource.active.is_(True))
+                )
+            )
+            current = next(
+                (
+                    row
+                    for row in sources
+                    if str(
+                        dict(row.metadata_json or {}).get("logical_source_key") or row.source_key
+                    )
+                    == source_key
+                ),
+                None,
+            )
+            new_scenes = {str(item["stable_key"]): dict(item) for item in preview.get("scenes", [])}
+            if current is None:
+                return {
+                    "source_key": source_key,
+                    "current_module_id": None,
+                    "added": sorted(new_scenes),
+                    "removed": [],
+                    "changed": [],
+                    "unchanged": [],
+                    "progress_impact": [],
+                }
+            rows = session.execute(
+                select(ModuleScene, ModuleChapter)
+                .join(ModuleChapter, ModuleChapter.id == ModuleScene.chapter_id)
+                .where(ModuleScene.module_id == current.id)
+            ).all()
+            old_scenes: dict[str, tuple[ModuleScene, ModuleChapter]] = {}
+            for scene, chapter in rows:
+                metadata = dict(scene.metadata_json or {})
+                stable_key = str(
+                    metadata.get("stable_key")
+                    or self._scene_stable_key((chapter.title, scene.title), scene.title)
+                )
+                old_scenes[stable_key] = (scene, chapter)
+            added = sorted(set(new_scenes) - set(old_scenes))
+            removed = sorted(set(old_scenes) - set(new_scenes))
+            shared = sorted(set(old_scenes) & set(new_scenes))
+            changed = [
+                key
+                for key in shared
+                if str(dict(old_scenes[key][0].metadata_json or {}).get("content_checksum") or "")
+                != str(new_scenes[key].get("content_checksum") or "")
+            ]
+            unchanged = sorted(set(shared) - set(changed))
+            old_ids = {scene.id: key for key, (scene, _chapter) in old_scenes.items()}
+            progress_rows = list(
+                session.scalars(
+                    select(SceneProgress).where(
+                        SceneProgress.campaign_id == campaign_id,
+                        SceneProgress.scene_id.in_(list(old_ids) or [""]),
+                    )
+                )
+            )
+            impact = [
+                {
+                    "scope_id": row.scope_id,
+                    "scene_id": row.scene_id,
+                    "stable_key": old_ids[row.scene_id],
+                    "action": "remap" if old_ids[row.scene_id] in new_scenes else "needs_dm_review",
+                    "target_stable_key": (
+                        old_ids[row.scene_id] if old_ids[row.scene_id] in new_scenes else None
+                    ),
+                }
+                for row in progress_rows
+            ]
+            return {
+                "source_key": source_key,
+                "current_module_id": current.id,
+                "added": added,
+                "removed": removed,
+                "changed": changed,
+                "unchanged": unchanged,
+                "progress_impact": impact,
+            }
+
     def list(self, campaign_id: str, *, include_retired: bool = False) -> list[dict[str, Any]]:
         with self.database.transaction() as session:
             statement = select(ModuleSource).where(ModuleSource.campaign_id == campaign_id)
@@ -551,6 +723,9 @@ class ModuleService:
                     "campaign_id": row.campaign_id,
                     "title": row.title,
                     "source_key": row.source_key,
+                    "logical_source_key": str(
+                        dict(row.metadata_json or {}).get("logical_source_key") or row.source_key
+                    ),
                     "source_path": row.source_path,
                     "checksum": row.checksum,
                     "active": row.active,
@@ -725,6 +900,39 @@ class ModuleService:
             row.active = active
             session.flush()
             return {"module_id": row.id, "active": row.active}
+
+    def activate_candidate(self, campaign_id: str, module_id: str) -> dict[str, Any]:
+        """Atomically make one staged revision current for its logical module key."""
+        with self.database.transaction() as session:
+            row = session.get(ModuleSource, module_id)
+            if row is None or row.campaign_id != campaign_id:
+                raise LookupError(module_id)
+            logical_key = str(
+                dict(row.metadata_json or {}).get("logical_source_key") or row.source_key
+            )
+            replaced: list[str] = []
+            for candidate in session.scalars(
+                select(ModuleSource).where(ModuleSource.campaign_id == campaign_id)
+            ):
+                candidate_key = str(
+                    dict(candidate.metadata_json or {}).get("logical_source_key")
+                    or candidate.source_key
+                )
+                if candidate.id != row.id and candidate.active and candidate_key == logical_key:
+                    candidate.active = False
+                    replaced.append(candidate.id)
+            row.active = True
+            row.metadata_json = {**dict(row.metadata_json or {}), "import_state": "active"}
+            session.flush()
+            return {"module_id": row.id, "active": True, "replaced_module_ids": replaced}
+
+    @staticmethod
+    def _scene_stable_key(heading_path: Sequence[str], title: str) -> str:
+        source = "/".join(str(item).strip() for item in heading_path if str(item).strip())
+        source = source or title
+        normalized = re.sub(r"[^a-z0-9]+", "-", source.casefold()).strip("-")
+        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+        return normalized[:120] or f"scene-{digest}"
 
     def rename(self, campaign_id: str, module_id: str, title: str) -> dict[str, Any]:
         with self.database.transaction() as session:

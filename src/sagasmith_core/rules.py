@@ -345,20 +345,23 @@ class RuleService:
         fts_ids: list[str] = []
         with self.database.transaction() as session:
             fts_ids = fts5_hits(
-                session, "rule_fts", enriched,
+                session,
+                "rule_fts",
+                enriched,
                 limit=max(top_k * 4, 20),
                 weights=(
-                    0.0,   # chunk_id UNINDEXED
-                    5.0,   # source_title
-                    5.0,   # section_title
-                    3.0,   # heading_path
-                    1.0,   # content
+                    0.0,  # chunk_id UNINDEXED
+                    5.0,  # source_title
+                    5.0,  # section_title
+                    3.0,  # heading_path
+                    1.0,  # content
                 ),
             )
             if fts_ids:
                 # Prune to rows that match the filter criteria
                 fts_filtered = [
-                    chunk_id for chunk_id in fts_ids
+                    chunk_id
+                    for chunk_id in fts_ids
                     if chunk_id in {row.RuleChunk.id for row in rows}
                 ]
                 fts_ids = fts_filtered
@@ -368,14 +371,17 @@ class RuleService:
         else:
             # Fallback: Python-side structured_score when FTS5 unavailable
             lexical = [
-                row.RuleChunk.id for row in sorted(
+                row.RuleChunk.id
+                for row in sorted(
                     rows,
-                    key=lambda row: -structured_score(
-                        enriched,
-                        section_title=row.RuleSection.title,
-                        source_title=row.RuleSource.title,
-                        heading_paths=" ".join(row.RuleChunk.heading_path or []),
-                        content=row.RuleChunk.content,
+                    key=lambda row: (
+                        -structured_score(
+                            enriched,
+                            section_title=row.RuleSection.title,
+                            source_title=row.RuleSource.title,
+                            heading_paths=" ".join(row.RuleChunk.heading_path or []),
+                            content=row.RuleChunk.content,
+                        )
                     ),
                 )
             ]
@@ -507,6 +513,29 @@ class RuleService:
                 "metadata": dict(row.metadata_json or {}),
             }
 
+    def source_chunks(self, source_id: str) -> list[dict[str, Any]]:
+        """Return deterministic source chunks for a reviewable content extractor."""
+        with self.database.transaction() as session:
+            source = session.get(RuleSource, source_id)
+            if source is None:
+                raise LookupError(source_id)
+            rows = session.scalars(
+                select(RuleChunk)
+                .where(RuleChunk.source_id == source_id)
+                .order_by(RuleChunk.ordinal, RuleChunk.id)
+            )
+            return [
+                {
+                    "id": row.id,
+                    "ordinal": row.ordinal,
+                    "heading_path": list(row.heading_path),
+                    "content": row.content,
+                    "page_start": dict(row.metadata_json or {}).get("page_start"),
+                    "page_end": dict(row.metadata_json or {}).get("page_end"),
+                }
+                for row in rows
+            ]
+
     def citation(self, chunk_id: str, *, source_id: str | None = None) -> dict[str, Any]:
         """Resolve a caller-supplied chunk id into canonical, source-bound evidence."""
         with self.database.transaction() as session:
@@ -525,9 +554,7 @@ class RuleService:
                 "source": f"rule-source:{row.RuleSource.source_key}",
                 "source_id": row.RuleSource.id,
                 "source_key": row.RuleSource.source_key,
-                "source_checksum": source_metadata.get(
-                    "source_checksum", row.RuleSource.checksum
-                ),
+                "source_checksum": source_metadata.get("source_checksum", row.RuleSource.checksum),
                 "chunk_id": row.RuleChunk.id,
                 "heading_path": list(row.RuleChunk.heading_path),
                 "page_start": metadata.get("page_start"),

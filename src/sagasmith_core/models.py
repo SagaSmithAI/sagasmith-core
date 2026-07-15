@@ -804,3 +804,33 @@ class ModuleAsset(TimestampMixin, Base):
     checksum: Mapped[str] = mapped_column(String(64), nullable=False)
     normalized_content: Mapped[str | None] = mapped_column(Text, nullable=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class ImportJob(TimestampMixin, Base):
+    """Durable authoring workflow state for rulebooks and adventure modules."""
+
+    __tablename__ = "import_jobs"
+    __table_args__ = (
+        Index("ix_import_job_campaign_kind_state", "campaign_id", "kind", "state"),
+        Index("ix_import_job_source", "source_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(
+        ForeignKey("campaigns.id", ondelete="CASCADE"), index=True
+    )
+    system_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="staged")
+    artifact: Mapped[str] = mapped_column(String(500), nullable=False)
+    artifact_checksum: Mapped[str] = mapped_column(String(64), default="")
+    source_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    module_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    parser_profile: Mapped[str] = mapped_column(String(100), default="")
+    parser_version: Mapped[str] = mapped_column(String(32), default="")
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    inspection: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    validation: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error: Mapped[str] = mapped_column(Text, default="")

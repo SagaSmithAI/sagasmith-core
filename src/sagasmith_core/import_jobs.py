@@ -1,0 +1,252 @@
+"""Durable, reviewable import lifecycles shared by rulebooks and modules."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+from uuid import uuid4
+
+from sqlalchemy import select
+
+from sagasmith_core.database import Database
+from sagasmith_core.models import Campaign, ImportJob
+
+
+class ImportJobError(ValueError):
+    """Raised when an import job is malformed or moved to an invalid state."""
+
+
+_KINDS = {"rulebook", "module"}
+_STATES = {
+    "staged",
+    "inspected",
+    "extracted",
+    "review_required",
+    "reviewed",
+    "compiled",
+    "validated",
+    "installed",
+    "imported",
+    "activated",
+    "failed",
+}
+
+
+@dataclass(frozen=True)
+class ImportJobInfo:
+    id: str
+    campaign_id: str
+    system_id: str
+    kind: str
+    state: str
+    artifact: str
+    artifact_checksum: str
+    source_id: str | None
+    module_id: str | None
+    parser_profile: str
+    parser_version: str
+    payload: dict[str, Any]
+    inspection: dict[str, Any]
+    candidates: list[dict[str, Any]]
+    validation: dict[str, Any]
+    result: dict[str, Any]
+    error: str
+
+
+class ImportJobService:
+    """Store import evidence separately from mutable source and campaign rows."""
+
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    def create(
+        self,
+        *,
+        campaign_id: str,
+        kind: str,
+        artifact: str,
+        artifact_checksum: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> ImportJobInfo:
+        if kind not in _KINDS:
+            raise ImportJobError(f"unsupported import kind: {kind}")
+        if not artifact.strip():
+            raise ImportJobError("import artifact is required")
+        with self.database.transaction() as session:
+            campaign = session.get(Campaign, campaign_id)
+            if campaign is None:
+                raise LookupError(campaign_id)
+            row = ImportJob(
+                id=str(uuid4()),
+                campaign_id=campaign_id,
+                system_id=campaign.system_id,
+                kind=kind,
+                artifact=artifact,
+                artifact_checksum=artifact_checksum,
+                payload=dict(payload or {}),
+            )
+            session.add(row)
+            session.flush()
+            return self._info(row)
+
+    def get(self, job_id: str) -> ImportJobInfo:
+        with self.database.transaction() as session:
+            row = session.get(ImportJob, job_id)
+            if row is None:
+                raise LookupError(job_id)
+            return self._info(row)
+
+    def list(self, campaign_id: str, *, kind: str | None = None) -> list[ImportJobInfo]:
+        statement = select(ImportJob).where(ImportJob.campaign_id == campaign_id)
+        if kind is not None:
+            statement = statement.where(ImportJob.kind == kind)
+        statement = statement.order_by(ImportJob.updated_at.desc(), ImportJob.id.desc())
+        with self.database.transaction() as session:
+            return [self._info(row) for row in session.scalars(statement)]
+
+    def record_inspection(
+        self,
+        job_id: str,
+        inspection: dict[str, Any],
+    ) -> ImportJobInfo:
+        return self._update(
+            job_id,
+            state="inspected",
+            inspection=dict(inspection),
+            parser_profile=str(inspection.get("parser_profile") or ""),
+            parser_version=str(inspection.get("parser_version") or ""),
+        )
+
+    def set_candidates(self, job_id: str, candidates: list[dict[str, Any]]) -> ImportJobInfo:
+        normalized: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for index, candidate in enumerate(candidates):
+            value = dict(candidate)
+            candidate_id = str(value.get("id") or "").strip()
+            if not candidate_id:
+                raise ImportJobError(f"candidates[{index}].id is required")
+            if candidate_id in seen:
+                raise ImportJobError("candidate ids must be unique")
+            seen.add(candidate_id)
+            status = str(value.get("review_status") or "pending")
+            if status not in {"pending", "accepted", "rejected", "needs_revision"}:
+                raise ImportJobError(f"candidates[{index}].review_status is invalid")
+            value["review_status"] = status
+            normalized.append(value)
+        return self._update(
+            job_id,
+            state="review_required" if normalized else "extracted",
+            candidates=normalized,
+        )
+
+    def review_candidates(
+        self,
+        job_id: str,
+        decisions: list[dict[str, Any]],
+    ) -> ImportJobInfo:
+        with self.database.transaction() as session:
+            row = self._row(session, job_id)
+            values = [dict(item) for item in row.candidates or []]
+            by_id = {str(item.get("id")): item for item in values}
+            for decision in decisions:
+                candidate_id = str(decision.get("id") or "").strip()
+                if candidate_id not in by_id:
+                    raise ImportJobError(f"unknown candidate: {candidate_id}")
+                status = str(decision.get("review_status") or "").strip()
+                if status not in {"accepted", "rejected", "needs_revision"}:
+                    raise ImportJobError(
+                        "review_status must be accepted, rejected, or needs_revision"
+                    )
+                candidate = by_id[candidate_id]
+                candidate["review_status"] = status
+                if "artifact" in decision:
+                    artifact = decision["artifact"]
+                    if not isinstance(artifact, dict):
+                        raise ImportJobError("candidate artifact must be an object")
+                    candidate["artifact"] = dict(artifact)
+                if "note" in decision:
+                    candidate["review_note"] = str(decision["note"])
+            row.candidates = values
+            row.state = (
+                "reviewed"
+                if values
+                and all(item.get("review_status") in {"accepted", "rejected"} for item in values)
+                else "review_required"
+            )
+            row.error = ""
+            session.flush()
+            return self._info(row)
+
+    def record_validation(
+        self,
+        job_id: str,
+        validation: dict[str, Any],
+        *,
+        state: str = "validated",
+    ) -> ImportJobInfo:
+        if state not in {"compiled", "validated", "installed", "imported", "activated", "failed"}:
+            raise ImportJobError(f"invalid validation state: {state}")
+        return self._update(job_id, state=state, validation=dict(validation))
+
+    def record_result(
+        self,
+        job_id: str,
+        result: dict[str, Any],
+        *,
+        state: str,
+        source_id: str | None = None,
+        module_id: str | None = None,
+    ) -> ImportJobInfo:
+        return self._update(
+            job_id,
+            state=state,
+            result=dict(result),
+            source_id=source_id,
+            module_id=module_id,
+            error="",
+        )
+
+    def fail(self, job_id: str, error: str) -> ImportJobInfo:
+        return self._update(job_id, state="failed", error=str(error))
+
+    def _update(self, job_id: str, *, state: str, **fields: Any) -> ImportJobInfo:
+        if state not in _STATES:
+            raise ImportJobError(f"invalid import state: {state}")
+        with self.database.transaction() as session:
+            row = self._row(session, job_id)
+            for key, value in fields.items():
+                setattr(row, key, value)
+            row.state = state
+            if state != "failed" and "error" not in fields:
+                row.error = ""
+            session.flush()
+            return self._info(row)
+
+    @staticmethod
+    def _row(session: Any, job_id: str) -> ImportJob:
+        row = session.get(ImportJob, job_id)
+        if row is None:
+            raise LookupError(job_id)
+        return row
+
+    @staticmethod
+    def _info(row: ImportJob) -> ImportJobInfo:
+        return ImportJobInfo(
+            id=row.id,
+            campaign_id=row.campaign_id,
+            system_id=row.system_id,
+            kind=row.kind,
+            state=row.state,
+            artifact=row.artifact,
+            artifact_checksum=row.artifact_checksum,
+            source_id=row.source_id,
+            module_id=row.module_id,
+            parser_profile=row.parser_profile,
+            parser_version=row.parser_version,
+            payload=dict(row.payload or {}),
+            inspection=dict(row.inspection or {}),
+            candidates=[dict(item) for item in row.candidates or []],
+            validation=dict(row.validation or {}),
+            result=dict(row.result or {}),
+            error=row.error,
+        )

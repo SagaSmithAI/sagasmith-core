@@ -22,6 +22,7 @@ from sagasmith_core.embeddings import (
 )
 from sagasmith_core.events import EventService
 from sagasmith_core.idempotency import IdempotencyConflictError, IdempotencyService, request_hash
+from sagasmith_core.import_jobs import ImportJobError, ImportJobService
 from sagasmith_core.knowledge import ActorKnowledgeService
 from sagasmith_core.memory import MemoryService
 from sagasmith_core.modules import ModuleService
@@ -55,6 +56,8 @@ __all__ = [
     "MemoryService",
     "IdempotencyConflictError",
     "IdempotencyService",
+    "ImportJobError",
+    "ImportJobService",
     "ModuleService",
     "NormalizedDocument",
     "PdfDocumentConverter",
