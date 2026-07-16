@@ -211,9 +211,34 @@ class CharacterService:
         summary: str = "",
         sheet: dict[str, Any] | None = None,
         notes: dict[str, Any] | None = None,
+        principal_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> tuple[CharacterInfo, CharacterInfo]:
         """Create a public-library template and an independent campaign instance."""
+        if (principal_id is None) != (idempotency_key is None):
+            raise ValueError("principal_id and idempotency_key must be supplied together")
+        payload = {
+            "system_id": system_id,
+            "campaign_id": campaign_id,
+            "name": name,
+            "character_type": character_type,
+            "player_name": player_name,
+            "summary": summary,
+            "sheet": sheet or {},
+            "notes": notes or {},
+        }
+        scope = f"character-build:{campaign_id}:{principal_id}" if principal_id else None
+        idempotency = IdempotencyService(self.database)
         with self.database.transaction() as session:
+            if scope is not None and idempotency_key is not None:
+                replay = idempotency.lookup_in_session(
+                    session, scope, idempotency_key, payload
+                )
+                if replay is not None and replay.response is not None:
+                    return (
+                        CharacterInfo(**replay.response["template"]),
+                        CharacterInfo(**replay.response["instance"]),
+                    )
             self._validate_campaign(session, system_id, campaign_id)
             template = Character(
                 id=str(uuid.uuid4()),
@@ -238,7 +263,20 @@ class CharacterService:
             )
             session.add_all([template, instance])
             session.flush()
-            return self._info(template), self._info(instance)
+            result = self._info(template), self._info(instance)
+            if scope is not None and idempotency_key is not None:
+                idempotency.remember_in_session(
+                    session,
+                    scope,
+                    idempotency_key,
+                    payload,
+                    {
+                        "template": result[0].__dict__,
+                        "instance": result[1].__dict__,
+                    },
+                    campaign_id=campaign_id,
+                )
+            return result
 
     def update(
         self,
@@ -307,4 +345,3 @@ class CharacterService:
             notes=dict(row.notes),
             revision=row.revision,
         )
-

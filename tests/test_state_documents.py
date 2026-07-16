@@ -317,6 +317,32 @@ def test_character_build_creates_template_and_instance_atomically(database) -> N
     assert instance.sheet == template.sheet
 
 
+def test_character_build_replays_template_and_instance_atomically(database) -> None:
+    campaign = CampaignService(database).create(system_id="dnd5e", name="Build replay")
+    characters = CharacterService(database)
+    arguments = {
+        "system_id": "dnd5e",
+        "campaign_id": campaign.id,
+        "name": "Mira",
+        "character_type": "pc",
+        "player_name": "Ada",
+        "sheet": {"hp": 10},
+        "notes": {"profile": {"summary": "A newly built hero."}},
+        "principal_id": "dm:ada",
+        "idempotency_key": "build-mira",
+    }
+
+    first = characters.create_with_instance(**arguments)
+    replay = characters.create_with_instance(**arguments)
+
+    assert replay[0].id == first[0].id
+    assert replay[1].id == first[1].id
+    assert [item.id for item in characters.list_library(system_id="dnd5e")] == [first[0].id]
+    assert [item.id for item in characters.list(system_id="dnd5e", campaign_id=campaign.id)] == [
+        first[1].id
+    ]
+
+
 def test_snapshot_restore_preserves_its_undo_cursor_and_retires_future_revisions(
     database,
 ) -> None:
