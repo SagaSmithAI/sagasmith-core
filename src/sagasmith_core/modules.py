@@ -163,20 +163,33 @@ class MarkdownModuleParser:
         if not chapter_starts:
             chapter_starts = [(0, headings[0])]
         parsed: list[ParsedChapter] = []
-        first_chapter_start = chapter_starts[0][1].start()
+        structural_starts = [
+            self._structural_start(content, heading) for _, heading in chapter_starts
+        ]
+        first_chapter_start = structural_starts[0]
         preamble = content[:first_chapter_start]
         if chapter_starts[0][1].group(1) == "#" and strip_page_markers(preamble).strip():
             parsed.append(self._chapter(0, "Front Matter", preamble, 0, first_chapter_start))
         for ordinal, (_heading_index, heading) in enumerate(chapter_starts):
-            start = heading.start()
+            start = structural_starts[ordinal]
             end = (
-                chapter_starts[ordinal + 1][1].start()
+                structural_starts[ordinal + 1]
                 if ordinal + 1 < len(chapter_starts)
                 else len(content)
             )
             title = heading.group(2).strip()
             parsed.append(self._chapter(len(parsed), title, content[start:end], start, end))
         return parsed
+
+    @staticmethod
+    def _structural_start(content: str, heading: re.Match[str]) -> int:
+        """Keep a page marker immediately preceding a chapter with that chapter."""
+        prefix = content[: heading.start()]
+        markers = list(re.finditer(r"^<!-- page: \d+ -->\s*$", prefix, re.MULTILINE))
+        if not markers:
+            return heading.start()
+        marker = markers[-1]
+        return marker.start() if not prefix[marker.end() :].strip() else heading.start()
 
     def _chapter(
         self,
@@ -297,9 +310,20 @@ class ModuleService:
         logical_source_key: str | None = None,
     ) -> ModuleIngestResult:
         checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        parsed = (parser or MarkdownModuleParser()).parse(content)
+        selected_parser = parser or MarkdownModuleParser()
+        parsed = selected_parser.parse(content)
+        profile = getattr(selected_parser, "profile", GenericModuleProfile())
+        parser_profile = getattr(profile, "name", "generic")
+        parser_version = getattr(profile, "version", "1")
         logical_key = logical_source_key or source_key
-        stored_source_key = source_key if activate else f"{logical_key}--staged-{checksum[:12]}"
+        stored_source_key = (
+            source_key
+            if activate
+            else (
+                f"{logical_key}--staged-{checksum[:12]}-"
+                f"{parser_profile}-{parser_version}"
+            )
+        )
         with self.database.transaction() as session:
             campaign = session.get(Campaign, campaign_id)
             if campaign is None:
@@ -310,7 +334,12 @@ class ModuleService:
                     ModuleSource.source_key == stored_source_key,
                 )
             )
-            if existing and existing.checksum == checksum:
+            if (
+                existing
+                and existing.checksum == checksum
+                and existing.parser_profile == parser_profile
+                and existing.parser_version == parser_version
+            ):
                 counts = self._counts(session, existing.id)
                 return ModuleIngestResult(existing.id, True, *counts, 0)
             if existing and activate:
@@ -325,7 +354,6 @@ class ModuleService:
                 session.flush()
 
             module_id = str(uuid.uuid4())
-            profile = getattr(parser, "profile", GenericModuleProfile())
             source_row = ModuleSource(
                 id=module_id,
                 system_id=campaign.system_id,
@@ -335,8 +363,8 @@ class ModuleService:
                 source_path=source_path,
                 checksum=checksum,
                 active=activate,
-                parser_profile=getattr(profile, "name", "generic"),
-                parser_version=getattr(profile, "version", "1"),
+                parser_profile=parser_profile,
+                parser_version=parser_version,
                 warnings=list(normalized_document.warnings) if normalized_document else [],
                 metadata_json={
                     **dict(metadata or {}),
@@ -592,6 +620,16 @@ class ModuleService:
                     errors.append(f"scene {stable_key} has a spatial location without a key")
                 if len(location_keys) != len(set(location_keys)):
                     errors.append(f"scene {stable_key} has duplicate spatial location keys")
+                page_start = metadata.get("page_start")
+                page_end = metadata.get("page_end")
+                if document.media_type == "application/pdf" and document.page_count is not None:
+                    if page_start is None or page_end is None:
+                        errors.append(f"scene {stable_key} has no PDF page range")
+                    elif not (1 <= int(page_start) <= int(page_end) <= document.page_count):
+                        errors.append(
+                            f"scene {stable_key} has invalid PDF page range "
+                            f"{page_start}-{page_end}"
+                        )
                 scenes.append(
                     {
                         "stable_key": stable_key,
@@ -602,6 +640,10 @@ class ModuleService:
                         "headings": list(scene.heading_path),
                         "scene_type": metadata.get("scene_type", "section"),
                         "visibility": metadata.get("visibility", "keeper"),
+                        "page_start": page_start,
+                        "page_end": page_end,
+                        "start_line": metadata.get("start_line"),
+                        "end_line": metadata.get("end_line"),
                         "keywords": list(metadata.get("keywords") or []),
                         "spatial": spatial,
                         "content_checksum": hashlib.sha256(

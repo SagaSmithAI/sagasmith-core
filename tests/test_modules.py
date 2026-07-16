@@ -1,5 +1,5 @@
 from sagasmith_core.campaigns import CampaignService
-from sagasmith_core.modules import MarkdownModuleParser, ModuleService
+from sagasmith_core.modules import MarkdownModuleParser, ModuleService, SceneBoundary
 from sagasmith_core.snapshots import SnapshotService
 
 
@@ -93,6 +93,25 @@ def test_module_parser_preserves_front_matter_before_first_chapter() -> None:
     assert [chapter.title for chapter in chapters] == ["Front Matter", "Chapter One"]
     assert chapters[0].scenes[0].title == "Adventure Overview"
     assert "city has fallen" in chapters[0].content
+    assert chapters[0].metadata["page_start"] == 1
+    assert chapters[1].metadata["page_start"] == 2
+    assert chapters[1].scenes[0].metadata["page_start"] == 2
+
+
+def test_module_preview_exposes_scene_page_and_line_provenance(database, tmp_path) -> None:
+    source = tmp_path / "module.md"
+    source.write_text(
+        "<!-- page: 7 -->\n# Chapter One\n\n## Arrival\n\nText.\n",
+        encoding="utf-8",
+    )
+
+    preview = ModuleService(database).preview_path(source)
+
+    assert preview["valid"] is True
+    assert preview["scenes"][0]["page_start"] == 7
+    assert preview["scenes"][0]["page_end"] == 7
+    assert preview["scenes"][0]["start_line"] is not None
+    assert preview["scenes"][0]["end_line"] is not None
 
 
 def test_scene_stable_keys_preserve_cjk_chapter_identity(database) -> None:
@@ -126,6 +145,49 @@ def test_scene_stable_keys_disambiguate_repeated_headings(database) -> None:
         "chapter-development",
         "chapter-development--2",
     ]
+
+
+def test_staged_module_reparses_same_content_when_parser_version_changes(database) -> None:
+    class VersionedProfile:
+        name = "test"
+
+        def __init__(self, version: str) -> None:
+            self.version = version
+
+        def classify_chunk(self, heading: str, text: str) -> str:
+            return "narrative"
+
+        def keywords(self, title: str, text: str) -> list[str]:
+            return []
+
+        def scene_boundaries(self, chapter_title: str, chapter_content: str):
+            return [SceneBoundary(f"Version {self.version}", 0, len(chapter_content))]
+
+    campaign = CampaignService(database).create(system_id="dnd5e", name="Parser revisions")
+    service = ModuleService(database)
+    content = "# Chapter\nBody.\n"
+    first = service.ingest(
+        campaign_id=campaign.id,
+        source_key="module",
+        logical_source_key="module",
+        title="Module",
+        content=content,
+        parser=MarkdownModuleParser(profile=VersionedProfile("1")),
+        activate=False,
+    )
+    second = service.ingest(
+        campaign_id=campaign.id,
+        source_key="module",
+        logical_source_key="module",
+        title="Module",
+        content=content,
+        parser=MarkdownModuleParser(profile=VersionedProfile("2")),
+        activate=False,
+    )
+
+    assert first.module_id != second.module_id
+    assert first.skipped is False
+    assert second.skipped is False
 
 
 def test_module_reimport_preserves_snapshot_scene_references(database) -> None:
