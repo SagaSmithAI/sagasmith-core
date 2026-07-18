@@ -1338,8 +1338,8 @@ class ModuleService:
         *,
         campaign_id: str,
         scene_id: str,
-        status: str = "current",
-        progress: int = 0,
+        status: str | None = None,
+        progress: int | None = None,
         state: dict[str, Any] | None = None,
         current_room: str | None = None,
         current_location_key: str | None = None,
@@ -1349,7 +1349,8 @@ class ModuleService:
     ) -> dict[str, Any]:
         if state is not None and spatial_review is not None:
             raise ValueError("state and spatial_review cannot be changed in the same request")
-        progress = max(0, min(100, progress))
+        if progress is not None:
+            progress = max(0, min(100, progress))
         with self.database.transaction() as session:
             scene = session.get(ModuleScene, scene_id)
             if scene is None:
@@ -1381,7 +1382,8 @@ class ModuleService:
                     f"scene progress conflict: expected {expected_state_version}, "
                     f"found {row.state_version}"
                 )
-            if status == "current":
+            effective_status = status or row.status or "current"
+            if effective_status == "current":
                 for other in session.scalars(
                     select(SceneProgress).where(
                         SceneProgress.campaign_id == campaign_id,
@@ -1391,8 +1393,10 @@ class ModuleService:
                     )
                 ):
                     other.status = "previous"
-            row.status = status
-            row.progress = progress
+            if status is not None:
+                row.status = status
+            if progress is not None:
+                row.progress = progress
             if current_room is not None:
                 row.current_room = current_room
             if current_location_key is not None:

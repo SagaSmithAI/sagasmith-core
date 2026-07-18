@@ -342,6 +342,7 @@ def test_reviewed_visual_connections_merge_and_restore_with_scene_progress(
         campaign_id=campaign.id,
         scene_id=scene["scene_id"],
         expected_state_version=0,
+        progress=40,
         current_location_key="d5",
         spatial_review={
             "source_asset_id": asset["id"],
@@ -381,6 +382,7 @@ def test_reviewed_visual_connections_merge_and_restore_with_scene_progress(
     )
 
     assert replaced["state"]["spatial_review"]["connections"][0]["from"] == "d6"
+    assert replaced["progress"] == 40
     current = modules.current_scene(campaign.id)
     assert current["spatial"]["connections"][0]["confidence"] == "reviewed_image"
     SnapshotService(database).restore(campaign.id, snapshot.slot)
