@@ -787,6 +787,70 @@ class ModuleService:
                 for row in rows
             ]
 
+    def list_assets(self, campaign_id: str, module_id: str) -> list[dict[str, Any]]:
+        """List source and derived assets belonging to one campaign module."""
+        with self.database.transaction() as session:
+            source = session.get(ModuleSource, module_id)
+            if source is None or source.campaign_id != campaign_id:
+                raise LookupError(module_id)
+            rows = session.scalars(
+                select(ModuleAsset)
+                .where(ModuleAsset.module_id == module_id)
+                .order_by(ModuleAsset.created_at, ModuleAsset.id)
+            )
+            return [self._asset_view(row) for row in rows]
+
+    def get_asset(self, campaign_id: str, asset_id: str) -> dict[str, Any]:
+        with self.database.transaction() as session:
+            row = session.get(ModuleAsset, asset_id)
+            if row is None:
+                raise LookupError(asset_id)
+            source = session.get(ModuleSource, row.module_id)
+            if source is None or source.campaign_id != campaign_id:
+                raise LookupError(asset_id)
+            return self._asset_view(row)
+
+    def register_asset(
+        self,
+        *,
+        campaign_id: str,
+        module_id: str,
+        source_path: str,
+        media_type: str,
+        checksum: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Idempotently register a managed derived module asset."""
+        resolved = str(Path(source_path).expanduser().resolve())
+        with self.database.transaction() as session:
+            source = session.get(ModuleSource, module_id)
+            if source is None or source.campaign_id != campaign_id:
+                raise LookupError(module_id)
+            row = session.scalar(
+                select(ModuleAsset).where(
+                    ModuleAsset.module_id == module_id,
+                    ModuleAsset.source_path == resolved,
+                )
+            )
+            if row is None:
+                row = ModuleAsset(
+                    id=str(uuid.uuid4()),
+                    module_id=module_id,
+                    source_path=resolved,
+                    media_type=media_type,
+                    checksum=checksum,
+                    normalized_content=None,
+                    metadata_json=dict(metadata or {}),
+                )
+                session.add(row)
+            elif row.checksum != checksum:
+                raise ValueError("managed module asset path has different content")
+            else:
+                row.media_type = media_type
+                row.metadata_json = {**dict(row.metadata_json or {}), **dict(metadata or {})}
+            session.flush()
+            return self._asset_view(row)
+
     def expand(self, chunk_id: str) -> dict[str, Any]:
         with self.database.transaction() as session:
             row = session.execute(
@@ -821,7 +885,14 @@ class ModuleService:
                 },
             }
 
-    def read_scene(self, campaign_id: str, scene_id: str) -> dict[str, Any]:
+    def read_scene(
+        self,
+        campaign_id: str,
+        scene_id: str,
+        *,
+        scope_id: str | None = None,
+        fallback_to_party: bool = True,
+    ) -> dict[str, Any]:
         with self.database.transaction() as session:
             row = session.execute(
                 select(ModuleScene, ModuleChapter, ModuleSource)
@@ -833,6 +904,24 @@ class ModuleService:
                 )
             ).one()
             metadata = dict(row.ModuleScene.metadata_json or {})
+            progress_state: dict[str, Any] | None = None
+            if scope_id is not None:
+                scopes = [scope_id]
+                if fallback_to_party and scope_id != "party":
+                    scopes.append("party")
+                for candidate_scope in scopes:
+                    progress = session.scalar(
+                        select(SceneProgress)
+                        .where(
+                            SceneProgress.campaign_id == campaign_id,
+                            SceneProgress.scene_id == scene_id,
+                            SceneProgress.scope_id == candidate_scope,
+                        )
+                        .order_by(SceneProgress.updated_at.desc(), SceneProgress.id.desc())
+                    )
+                    if progress is not None:
+                        progress_state = dict(progress.state or {})
+                        break
             return {
                 "scene_id": row.ModuleScene.id,
                 "stable_key": metadata.get("stable_key"),
@@ -849,7 +938,7 @@ class ModuleService:
                 "start_line": row.ModuleScene.start_line,
                 "end_line": row.ModuleScene.end_line,
                 "keywords": list(row.ModuleScene.keywords),
-                **self._scene_structure(row.ModuleScene),
+                **self._scene_structure(row.ModuleScene, progress_state=progress_state),
             }
 
     def scene_index(
@@ -950,7 +1039,10 @@ class ModuleService:
                     "state_version": row.SceneProgress.state_version,
                     "state": dict(row.SceneProgress.state),
                 },
-                **self._scene_structure(row.ModuleScene),
+                **self._scene_structure(
+                    row.ModuleScene,
+                    progress_state=dict(row.SceneProgress.state or {}),
+                ),
             }
 
     def scene_progress_index(
@@ -1253,7 +1345,10 @@ class ModuleService:
         current_location_key: str | None = None,
         scope_id: str = "party",
         expected_state_version: int | None = None,
+        spatial_review: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if state is not None and spatial_review is not None:
+            raise ValueError("state and spatial_review cannot be changed in the same request")
         progress = max(0, min(100, progress))
         with self.database.transaction() as session:
             scene = session.get(ModuleScene, scene_id)
@@ -1334,6 +1429,14 @@ class ModuleService:
             row.state_version = (row.state_version or 0) + 1
             if state is not None:
                 row.state = state
+            elif spatial_review is not None:
+                row.state = self._apply_spatial_review(
+                    session,
+                    scene=scene,
+                    campaign_id=campaign_id,
+                    state=dict(row.state or {}),
+                    review=spatial_review,
+                )
             session.flush()
             return {
                 "id": row.id,
@@ -1349,7 +1452,164 @@ class ModuleService:
             }
 
     @staticmethod
-    def _scene_structure(scene: ModuleScene) -> dict[str, Any]:
+    def _apply_spatial_review(
+        session: Any,
+        *,
+        scene: ModuleScene,
+        campaign_id: str,
+        state: dict[str, Any],
+        review: dict[str, Any],
+    ) -> dict[str, Any]:
+        allowed_review_fields = {
+            "schema_version",
+            "mode",
+            "source_asset_id",
+            "page_number",
+            "connections",
+            "reviewer",
+            "branch_id",
+            "note",
+        }
+        unknown = set(review) - allowed_review_fields
+        if unknown:
+            raise ValueError(f"unsupported spatial_review fields: {sorted(unknown)}")
+        if review.get("schema_version", 1) != 1:
+            raise ValueError("spatial_review schema_version must be 1")
+        mode = str(review.get("mode") or "merge")
+        if mode not in {"merge", "replace"}:
+            raise ValueError("spatial_review mode must be merge or replace")
+        asset_id = str(review.get("source_asset_id") or "").strip()
+        if not asset_id:
+            raise ValueError("spatial_review source_asset_id is required")
+        asset = session.get(ModuleAsset, asset_id)
+        if asset is None or asset.module_id != scene.module_id:
+            raise ValueError("spatial_review asset must belong to the scene module")
+        source = session.get(ModuleSource, scene.module_id)
+        if source is None or source.campaign_id != campaign_id:
+            raise ValueError("scene does not belong to campaign")
+        if asset.media_type not in {"application/pdf", "image/png", "image/jpeg"}:
+            raise ValueError("spatial_review requires a PDF or rendered image asset")
+        page_number = review.get("page_number")
+        if not isinstance(page_number, int) or isinstance(page_number, bool) or page_number < 1:
+            raise ValueError("spatial_review page_number must be a 1-based integer")
+        asset_metadata = dict(asset.metadata_json or {})
+        if asset.media_type == "application/pdf":
+            page_count = int(asset_metadata.get("page_count") or 0)
+            if page_count and page_number > page_count:
+                raise ValueError(f"spatial_review page exceeds PDF page count {page_count}")
+        else:
+            source_page = int(asset_metadata.get("source_page") or 0)
+            if source_page and page_number != source_page:
+                raise ValueError("spatial_review page must match the rendered asset source_page")
+
+        location_counts: dict[str, int] = {}
+        for candidate in session.scalars(
+            select(ModuleScene).where(ModuleScene.module_id == scene.module_id)
+        ):
+            for location in (
+                dict(candidate.metadata_json or {}).get("spatial", {}).get("locations", [])
+            ):
+                if not isinstance(location, dict) or not location.get("key"):
+                    continue
+                key = str(location["key"])
+                location_counts[key] = location_counts.get(key, 0) + 1
+
+        raw_connections = review.get("connections")
+        if not isinstance(raw_connections, list) or not raw_connections:
+            raise ValueError("spatial_review connections must be a non-empty list")
+        if len(raw_connections) > 500:
+            raise ValueError("spatial_review cannot change more than 500 connections at once")
+        reviewer = str(review.get("reviewer") or "").strip()
+        if not reviewer:
+            raise ValueError("spatial_review reviewer is required")
+        branch_id = str(review.get("branch_id") or "").strip()
+        if not branch_id:
+            raise ValueError("spatial_review branch_id is required")
+        kinds = {"passage", "door", "secret_door", "stairs", "portal", "other"}
+        normalized: list[dict[str, Any]] = []
+        for index, raw in enumerate(raw_connections):
+            if not isinstance(raw, dict):
+                raise ValueError("each reviewed connection must be an object")
+            unknown_connection = set(raw) - {
+                "from",
+                "to",
+                "bidirectional",
+                "kind",
+                "observation",
+            }
+            if unknown_connection:
+                raise ValueError(
+                    f"unsupported reviewed connection fields at index {index}: "
+                    f"{sorted(unknown_connection)}"
+                )
+            source_key = str(raw.get("from") or "").strip()
+            target_key = str(raw.get("to") or "").strip()
+            if not source_key or not target_key or source_key == target_key:
+                raise ValueError("reviewed connection endpoints must be distinct location keys")
+            for key in (source_key, target_key):
+                if location_counts.get(key) != 1:
+                    raise ValueError(
+                        f"reviewed connection endpoint must identify exactly one module "
+                        f"location: {key}"
+                    )
+            bidirectional = raw.get("bidirectional", True)
+            if not isinstance(bidirectional, bool):
+                raise ValueError("reviewed connection bidirectional must be boolean")
+            kind = str(raw.get("kind") or "passage")
+            if kind not in kinds:
+                raise ValueError(f"unsupported reviewed connection kind: {kind}")
+            observation = str(raw.get("observation") or "").strip()
+            if not observation or len(observation) > 500:
+                raise ValueError("reviewed connection observation must contain 1-500 characters")
+            normalized.append(
+                {
+                    "from": source_key,
+                    "to": target_key,
+                    "bidirectional": bidirectional,
+                    "kind": kind,
+                    "confidence": "reviewed_image",
+                    "evidence": {
+                        "asset_id": asset.id,
+                        "asset_checksum": asset.checksum,
+                        "page": page_number,
+                        "observation": observation,
+                        "reviewer": reviewer,
+                        "branch_id": branch_id,
+                    },
+                }
+            )
+
+        previous = dict(state.get("spatial_review") or {})
+        existing = [] if mode == "replace" else list(previous.get("connections") or [])
+        by_key: dict[tuple[str, str, bool], dict[str, Any]] = {}
+        for connection in [*existing, *normalized]:
+            if not isinstance(connection, dict):
+                continue
+            source_key = str(connection.get("from") or "")
+            target_key = str(connection.get("to") or "")
+            bidirectional = bool(connection.get("bidirectional", True))
+            if bidirectional:
+                source_key, target_key = sorted((source_key, target_key))
+            by_key[(source_key, target_key, bidirectional)] = connection
+        state["spatial_review"] = {
+            "schema_version": 1,
+            "connections": list(by_key.values()),
+            "last_evidence": {
+                "asset_id": asset.id,
+                "page": page_number,
+                "reviewer": reviewer,
+                "branch_id": branch_id,
+                "note": str(review.get("note") or "").strip(),
+            },
+        }
+        return state
+
+    @staticmethod
+    def _scene_structure(
+        scene: ModuleScene,
+        *,
+        progress_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Build a scene-structure dict from DB columns + profile-populated metadata.
 
         Column-backed fields (always populated regardless of profile):
@@ -1368,6 +1628,27 @@ class ModuleService:
           - ``transitions``, ``node_id`` — CoC ``solo_scenario`` parsing only
         """
         metadata = dict(scene.metadata_json or {})
+        spatial = dict(metadata.get("spatial") or {})
+        reviewed = dict((progress_state or {}).get("spatial_review") or {})
+        reviewed_connections = list(reviewed.get("connections") or [])
+        if reviewed_connections:
+            base_connections = list(spatial.get("connections") or [])
+            by_key: dict[tuple[str, str, bool], dict[str, Any]] = {}
+            for connection in [*base_connections, *reviewed_connections]:
+                if not isinstance(connection, dict):
+                    continue
+                source_key = str(connection.get("from") or "")
+                target_key = str(connection.get("to") or "")
+                bidirectional = bool(connection.get("bidirectional", True))
+                if bidirectional:
+                    source_key, target_key = sorted((source_key, target_key))
+                by_key[(source_key, target_key, bidirectional)] = connection
+            spatial["connections"] = list(by_key.values())
+            spatial["review"] = {
+                "schema_version": reviewed.get("schema_version", 1),
+                "connection_count": len(reviewed_connections),
+                "last_evidence": dict(reviewed.get("last_evidence") or {}),
+            }
         return {
             "scene_type": scene.scene_type,
             "visibility": metadata.get("visibility", "keeper"),
@@ -1381,7 +1662,18 @@ class ModuleService:
             "sanity": list(metadata.get("sanity", [])),
             "transitions": list(metadata.get("transitions", [])),
             "node_id": metadata.get("node_id"),
-            "spatial": dict(metadata.get("spatial") or {}),
+            "spatial": spatial,
+        }
+
+    @staticmethod
+    def _asset_view(asset: ModuleAsset) -> dict[str, Any]:
+        return {
+            "id": asset.id,
+            "module_id": asset.module_id,
+            "source_path": asset.source_path,
+            "media_type": asset.media_type,
+            "checksum": asset.checksum,
+            "metadata": dict(asset.metadata_json or {}),
         }
 
     @staticmethod

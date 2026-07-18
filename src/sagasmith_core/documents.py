@@ -38,6 +38,22 @@ class NormalizedDocument:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class RenderedDocumentPage:
+    """One visually faithful raster page with source provenance."""
+
+    content: bytes
+    media_type: str
+    source_path: str
+    source_checksum: str
+    page_number: int
+    page_count: int
+    width: int
+    height: int
+    scale: float
+    checksum: str
+
+
 class DocumentConverter(Protocol):
     def convert(self, path: str | Path) -> NormalizedDocument: ...
 
@@ -365,6 +381,68 @@ class PdfDocumentConverter:
         if isinstance(outline, list):
             walk(outline)
         return result
+
+
+def render_pdf_page(
+    path: str | Path,
+    page_number: int,
+    *,
+    scale: float = 1.5,
+) -> RenderedDocumentPage:
+    """Render one 1-based PDF page without weakening text-parser boundaries.
+
+    Rendering is deliberately separate from structural text conversion.  It is
+    intended for maps, diagrams, handouts, and other visual evidence that an
+    importing agent or human must review explicitly before deriving structure.
+    """
+    source = Path(path).expanduser().resolve()
+    if source.suffix.casefold() != ".pdf" or not source.is_file():
+        raise ValueError("page rendering requires an existing PDF file")
+    if not isinstance(page_number, int) or isinstance(page_number, bool):
+        raise TypeError("page_number must be a 1-based integer")
+    if not 0.5 <= scale <= 4.0:
+        raise ValueError("scale must be between 0.5 and 4.0")
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        raise RuntimeError(
+            "PDF page rendering requires `pip install sagasmith-core[documents]`"
+        ) from exc
+
+    document = pdfium.PdfDocument(str(source))
+    try:
+        page_count = len(document)
+        if not 1 <= page_number <= page_count:
+            raise ValueError(f"page_number must be between 1 and {page_count}")
+        page = document[page_number - 1]
+        try:
+            bitmap = page.render(scale=scale)
+            try:
+                image = bitmap.to_pil()
+                from io import BytesIO
+
+                output = BytesIO()
+                image.save(output, format="PNG", optimize=True)
+                content = output.getvalue()
+                width, height = image.size
+            finally:
+                bitmap.close()
+        finally:
+            page.close()
+    finally:
+        document.close()
+    return RenderedDocumentPage(
+        content=content,
+        media_type="image/png",
+        source_path=str(source),
+        source_checksum=hashlib.sha256(source.read_bytes()).hexdigest(),
+        page_number=page_number,
+        page_count=page_count,
+        width=width,
+        height=height,
+        scale=float(scale),
+        checksum=hashlib.sha256(content).hexdigest(),
+    )
 
 
 def converter_for(path: str | Path, *, ocr_provider: OcrProvider | None = None):

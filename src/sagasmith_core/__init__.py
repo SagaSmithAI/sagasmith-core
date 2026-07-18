@@ -10,6 +10,8 @@ from sagasmith_core.documents import (
     DocumentQualityError,
     NormalizedDocument,
     PdfDocumentConverter,
+    RenderedDocumentPage,
+    render_pdf_page,
 )
 from sagasmith_core.embeddings import (
     BgeEmbedder,
@@ -61,6 +63,7 @@ __all__ = [
     "ModuleService",
     "NormalizedDocument",
     "PdfDocumentConverter",
+    "RenderedDocumentPage",
     "RevisionService",
     "RuleProfileService",
     "RuleReceiptService",
@@ -75,6 +78,7 @@ __all__ = [
     "create_embedder",
     "default_local_principal",
     "request_hash",
+    "render_pdf_page",
 ]
 
 __version__ = "0.2.0"

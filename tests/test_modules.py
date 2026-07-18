@@ -1,4 +1,5 @@
 from sagasmith_core.campaigns import CampaignService
+from sagasmith_core.documents import NormalizedDocument
 from sagasmith_core.modules import MarkdownModuleParser, ModuleService, SceneBoundary
 from sagasmith_core.snapshots import SnapshotService
 
@@ -280,3 +281,109 @@ def test_module_reimport_preserves_snapshot_scene_references(database) -> None:
     restored = SnapshotService(database).restore(campaign.id, snapshot.slot)
     assert restored.parent_id == snapshot.id
     assert modules.current_scene(campaign.id)["title"] == "Gate"
+
+
+def test_reviewed_visual_connections_merge_and_restore_with_scene_progress(
+    database, tmp_path
+) -> None:
+    class SpatialProfile:
+        name = "spatial-review"
+        version = "1"
+
+        def classify_chunk(self, heading: str, text: str) -> str:
+            return "room"
+
+        def keywords(self, title: str, text: str) -> list[str]:
+            return []
+
+        def scene_boundaries(self, chapter_title: str, chapter_content: str):
+            return [
+                SceneBoundary(
+                    "Dungeon",
+                    0,
+                    len(chapter_content),
+                    metadata={
+                        "spatial": {
+                            "schema_version": 1,
+                            "grid": {"kind": "square", "cell_ft": 5},
+                            "locations": [
+                                {"key": "d5", "title": "D5"},
+                                {"key": "d6", "title": "D6"},
+                                {"key": "d7", "title": "D7"},
+                            ],
+                            "connections": [],
+                        }
+                    },
+                )
+            ]
+
+    campaign = CampaignService(database).create(system_id="dnd5e", name="Reviewed map")
+    source = tmp_path / "dungeon.pdf"
+    source.write_bytes(b"test-pdf")
+    content = "# Chapter\n## Dungeon\nD5. Entry\nD6. Morgue\nD7. Altar\n"
+    modules = ModuleService(database)
+    imported = modules.ingest(
+        campaign_id=campaign.id,
+        source_key="dungeon.pdf",
+        title="Dungeon",
+        content=content,
+        parser=MarkdownModuleParser(profile=SpatialProfile()),
+        normalized_document=NormalizedDocument(
+            content=content,
+            media_type="application/pdf",
+            source_path=str(source),
+            checksum="a" * 64,
+            page_count=30,
+        ),
+    )
+    scene = modules.scene_index(campaign.id)[0]
+    asset = modules.list_assets(campaign.id, imported.module_id)[0]
+    reviewed = modules.set_scene_progress(
+        campaign_id=campaign.id,
+        scene_id=scene["scene_id"],
+        expected_state_version=0,
+        current_location_key="d5",
+        spatial_review={
+            "source_asset_id": asset["id"],
+            "page_number": 22,
+            "reviewer": "dm:test",
+            "branch_id": "branch-main",
+            "connections": [
+                {
+                    "from": "d5",
+                    "to": "d6",
+                    "kind": "passage",
+                    "observation": "The map draws an open corridor between D5 and D6.",
+                }
+            ],
+        },
+    )
+    snapshot = SnapshotService(database).create(campaign.id, label="Reviewed D5-D6")
+    replaced = modules.set_scene_progress(
+        campaign_id=campaign.id,
+        scene_id=scene["scene_id"],
+        expected_state_version=reviewed["state_version"],
+        spatial_review={
+            "mode": "replace",
+            "source_asset_id": asset["id"],
+            "page_number": 22,
+            "reviewer": "dm:test",
+            "branch_id": "branch-main",
+            "connections": [
+                {
+                    "from": "d6",
+                    "to": "d7",
+                    "kind": "door",
+                    "observation": "Replacement review for restore verification.",
+                }
+            ],
+        },
+    )
+
+    assert replaced["state"]["spatial_review"]["connections"][0]["from"] == "d6"
+    current = modules.current_scene(campaign.id)
+    assert current["spatial"]["connections"][0]["confidence"] == "reviewed_image"
+    SnapshotService(database).restore(campaign.id, snapshot.slot)
+    restored = modules.current_scene(campaign.id)
+    assert restored["progress"]["state"]["spatial_review"]["connections"][0]["to"] == "d6"
+    assert restored["spatial"]["review"]["connection_count"] == 1
