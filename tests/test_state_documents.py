@@ -240,6 +240,128 @@ def test_pdf_normalization_keeps_toc_entries_out_of_heading_hierarchy() -> None:
     assert "# 第二章：坠落" not in content
 
 
+def test_pdf_normalization_recognizes_letter_spaced_english_contents() -> None:
+    content, metadata, _warnings = build_structured_markdown(
+        [
+            "Ta b l e o f C o n t e n t s\n"
+            "Episode 1: Arrival...................... 6\n"
+            "Episode 2: Pursuit.....................14\n"
+            "Episode 3: The Lair....................21\n"
+            "Appendix A: Backgrounds...............87\n"
+            "Appendix B: Monsters..................88\n"
+            "Appendix C: Items.....................94\n"
+            "Map: The Coast..........................4\n"
+        ],
+        [],
+        {1: [("Ta b l e o f C o n t e n t s", 4)]},
+    )
+
+    assert metadata["toc_pages"] == [1]
+    assert "# Episode 1" not in content
+    assert "#### Ta b l e" not in content
+
+
+def test_pdf_normalization_promotes_only_targeted_top_level_bookmark() -> None:
+    content, metadata, _warnings = build_structured_markdown(
+        [
+            "E pisode 1 : G reenest in F l a m e s\nBody text.\n"
+            'Chapter 9 ("Lyn Armaal," area 23)\nReference text.'
+        ],
+        [DocumentBookmark("Episode 1: Greenest in Flames", 1, 0)],
+        {1: [('Chapter 9 ("Lyn Armaal," area 23)', 3)]},
+    )
+
+    assert "# Episode 1: Greenest in Flames" in content
+    assert '### Chapter 9 ("Lyn Armaal," area 23)' in content
+    assert not any(
+        line.startswith('# Chapter 9 ("Lyn Armaal," area 23)')
+        for line in content.splitlines()
+    )
+    assert metadata["matched_bookmarks"] == 1
+
+
+def test_pdf_normalization_uses_shallowest_structural_outline_depth() -> None:
+    content, metadata, _warnings = build_structured_markdown(
+        [
+            "BOOK TITLE\n"
+            "CHAPTER 1: FIREBALL\n"
+            "Body.\n"
+            "CHAPTER 2: TROLLSKULL ALLEY\n"
+            "Body."
+        ],
+        [
+            DocumentBookmark("Book Title", 1, 0),
+            DocumentBookmark("Ch. 1: Fireball", 1, 1),
+            DocumentBookmark("Ch. 2: Trollskull Alley", 1, 1),
+        ],
+    )
+
+    assert "# Ch. 1: Fireball" in content
+    assert "# Ch. 2: Trollskull Alley" in content
+    assert metadata["matched_bookmarks"] == 3
+
+
+def test_pdf_normalization_deduplicates_outline_anchored_running_header() -> None:
+    content, _metadata, _warnings = build_structured_markdown(
+        [
+            "PART 2: PHANDALIN\nBody.\n",
+            "PART 2: PHANDALIN\nContinued body.",
+        ],
+        [DocumentBookmark("Part 2: Phandalin", 1, 0)],
+        {1: [("PART 2: PHANDALIN", 2)], 2: [("PART 2: PHANDALIN", 3)]},
+    )
+
+    assert sum(line.startswith("# ") for line in content.splitlines()) == 1
+
+
+def test_pdf_normalization_keeps_page_heading_over_corrupt_appendix_outline() -> None:
+    content, _metadata, _warnings = build_structured_markdown(
+        ["APPENDIX B: MONSTERS\nBody."],
+        [DocumentBookmark("App. 8: Monsters", 1, 0)],
+    )
+
+    assert "# APPENDIX B: MONSTERS" in content
+    assert "App. 8" not in content
+
+
+def test_pdf_normalization_recovers_corrupt_structural_heading_from_outline() -> None:
+    content, metadata, _warnings = build_structured_markdown(
+        ["CHAPTER 8 ( Wl~TER WIZARDRY\nBody."],
+        [DocumentBookmark("Ch. 8: Winter Wizardry", 1, 1)],
+    )
+
+    assert "# Ch. 8: Winter Wizardry" in content
+    assert metadata["matched_bookmarks"] == 1
+
+
+def test_pdf_normalization_synthesizes_outline_only_chapter_at_target_page() -> None:
+    content, metadata, _warnings = build_structured_markdown(
+        ["ANSHOON YEARNS TO RULE WATERDEEP\nBody."],
+        [DocumentBookmark("Ch. 8: Winter Wizardry", 1, 1)],
+    )
+
+    assert content.startswith("<!-- page: 1 -->\n\n# Ch. 8: Winter Wizardry")
+    assert "ANSHOON YEARNS TO RULE WATERDEEP" in content
+    assert metadata["matched_bookmarks"] == 0
+    assert metadata["synthetic_outline_headings"] == 1
+
+
+def test_pdf_normalization_moves_late_outline_chapter_anchor_to_page_start() -> None:
+    content, metadata, _warnings = build_structured_markdown(
+        [
+            "Decorative drop cap paragraph.\nOne.\nTwo.\nThree.\nFour.\nFive.\n"
+            "Six.\nSeven.\nEight.\nNine.\nCh . 1: A Friend in Need\nBody."
+        ],
+        [DocumentBookmark("Ch . 1: A Friend in Need", 1, 1)],
+        {1: [("Ch . 1: A Friend in Need", 3)]},
+    )
+
+    assert content.startswith("<!-- page: 1 -->\n\n# Ch. 1: A Friend in Need")
+    assert content.count("A Friend in Need") == 1
+    assert metadata["matched_bookmarks"] == 1
+    assert metadata["synthetic_outline_headings"] == 1
+
+
 def test_pdf_normalization_does_not_promote_chapter_references_in_body() -> None:
     content, metadata, _warnings = build_structured_markdown(
         [

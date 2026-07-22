@@ -16,7 +16,7 @@ from statistics import median
 from typing import Any, Protocol
 from uuid import uuid4
 
-DOCUMENT_NORMALIZER_VERSION = "5"
+DOCUMENT_NORMALIZER_VERSION = "11"
 _DOCUMENT_CACHE_SCHEMA = 1
 _PDF_EXTRACTION_CACHE_SCHEMA = 1
 _PDF_TEXT_EXTRACTOR_VERSION = "3"
@@ -87,7 +87,8 @@ class OcrProvider(Protocol):
 
 _CHAPTER_RE = re.compile(
     r"^(?:(?:第[一二三四五六七八九十百0-9]+章|附录\s*[A-ZＡ-Ｚ])(?:\s|：|:)|"
-    r"(?:Chapter|Appendix)\s+[0-9A-Z]+(?:\s|:))",
+    r"(?:Ch(?:apter)?\s*\.?|App(?:endix)?\s*\.?|Part|Episodes?)\s+"
+    r"(?:[0-9A-Z]+(?:\s+and\s+[0-9A-Z]+)?)(?:\s|：|:|-))",
     re.IGNORECASE,
 )
 _ROOM_RE = re.compile(r"^[A-Z]{1,3}\d+[A-Za-z]?\s*[.．]\s*\S+")
@@ -133,6 +134,84 @@ def _clean_line(value: str) -> str:
     return re.sub(r"[ \t]+", " ", value).strip()
 
 
+def _looks_letter_spaced(value: str) -> bool:
+    """Recognize display-font extraction that splits words into letter tokens."""
+    words = re.findall(r"[A-Za-z]+", value)
+    singles = sum(len(word) == 1 for word in words)
+    return singles >= 3 and singles / max(len(words), 1) >= 0.3
+
+
+def _bookmark_title(value: str) -> str:
+    """Collapse control whitespace found in otherwise useful outline titles."""
+    title = " ".join(value.split())
+    return re.sub(r"^(Ch|App)\s+\.", r"\1.", title, flags=re.IGNORECASE)
+
+
+def _prefer_bookmark_title(raw: str, bookmark: str, *, trusted: bool = False) -> bool:
+    """Use an outline label when it repairs layout damage without losing text truth."""
+    canonical = _bookmark_title(bookmark)
+    if _looks_letter_spaced(raw):
+        return True
+    # Some outlines OCR the appendix letter B as the digit 8. The page heading
+    # is stronger evidence in that narrow conflict.
+    if re.match(r"^App\.?\s*\d", canonical, re.IGNORECASE) and re.match(
+        r"^Appendix\s+[A-Z]", raw, re.IGNORECASE
+    ):
+        return False
+    if trusted:
+        return True
+    raw_normalized = _normalize(raw)
+    canonical_normalized = _normalize(canonical)
+    return bool(
+        raw_normalized
+        and canonical_normalized
+        and (
+            (
+                raw_normalized in canonical_normalized
+                and len(canonical_normalized) >= len(raw_normalized) + 3
+            )
+            or (
+                _CHAPTER_RE.match(canonical)
+                and SequenceMatcher(None, raw_normalized, canonical_normalized).ratio()
+                >= 0.88
+            )
+        )
+    )
+
+
+def _chapter_identity(value: str) -> str:
+    """Compare abbreviated and full chapter labels as the same boundary."""
+    text = value.strip()
+    text = re.sub(
+        r"^Ch(?:apter)?\s*\.?\s*", "chapter ", text, flags=re.IGNORECASE
+    )
+    text = re.sub(
+        r"^App(?:endix)?\s*\.?\s*", "appendix ", text, flags=re.IGNORECASE
+    )
+    return _normalize(text)
+
+
+def _looks_like_automatic_chapter_heading(value: str) -> bool:
+    """Accept a chapter boundary without outline evidence only when unambiguous."""
+    text = value.strip()
+    if not _CHAPTER_RE.match(text):
+        return False
+    if re.search(r"\.{3,}\s*\d+\s*$", text) or re.search(r"\s\d+\s*$", text):
+        return False
+    if re.match(r"^(?:第[一二三四五六七八九十百0-9]+章|附录\s*[A-ZＡ-Ｚ])", text):
+        return True
+    # Parenthesized chapter references, prose such as "chapter 3 for an
+    # example", and running headers corrupted to "CHAPTER 3 I TITLE" must not
+    # become document boundaries merely because their font differs from body.
+    return bool(
+        re.match(
+            r"^(?:Chapter|Appendix|Part|Episode)\s+[0-9A-Z]+\s*[:：—-]\s*\S+",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
 def _repeated_margin_lines(pages: list[list[str]]) -> set[str]:
     candidates: Counter[str] = Counter()
     for lines in pages:
@@ -156,16 +235,36 @@ def _repeated_margin_lines(pages: list[list[str]]) -> set[str]:
 def _match_bookmarks(
     pages: list[list[str]],
     bookmarks: list[DocumentBookmark],
-) -> tuple[dict[tuple[int, int], int], int]:
+) -> tuple[
+    dict[tuple[int, int], int],
+    int,
+    set[tuple[int, int]],
+    dict[tuple[int, int], str],
+    dict[int, list[str]],
+]:
     levels: dict[tuple[int, int], int] = {}
+    trusted_chapters: set[tuple[int, int]] = set()
+    canonical_titles: dict[tuple[int, int], str] = {}
+    synthetic_chapters: dict[int, list[str]] = {}
+    structural_depths = [
+        bookmark.depth for bookmark in bookmarks if _CHAPTER_RE.match(bookmark.title.strip())
+    ]
+    structural_depth = min(structural_depths) if structural_depths else None
     matched = 0
     for bookmark in bookmarks:
         if not 1 <= bookmark.page <= len(pages):
             continue
         target = _normalize(bookmark.title)
+        structural_bookmark = bool(_CHAPTER_RE.match(bookmark.title.strip()))
         best_index = -1
         best_score = 0.0
         for index, line in enumerate(pages[bookmark.page - 1]):
+            if (
+                structural_bookmark
+                and not _CHAPTER_RE.match(line)
+                and not _looks_letter_spaced(line)
+            ):
+                continue
             candidate = _normalize(line)
             if not target or not candidate:
                 continue
@@ -178,12 +277,49 @@ def _match_bookmarks(
                 score = SequenceMatcher(None, target, candidate).ratio()
             if score > best_score:
                 best_score, best_index = score, index
-        if best_index >= 0 and best_score >= 0.68:
+        threshold = 0.45 if structural_bookmark else 0.68
+        if best_index >= 0 and best_score >= threshold:
             key = (bookmark.page, best_index)
             level = min(4, 2 + bookmark.depth)
             levels[key] = min(level, levels.get(key, level))
+            trusted_chapter = bool(
+                structural_depth is not None
+                and bookmark.depth == structural_depth
+                and _CHAPTER_RE.match(bookmark.title.strip())
+            )
+            nonempty_before = sum(
+                bool(line)
+                for line in pages[bookmark.page - 1][:best_index]
+            )
+            if trusted_chapter and nonempty_before > 8:
+                title = _bookmark_title(bookmark.title)
+                page_titles = synthetic_chapters.setdefault(bookmark.page, [])
+                if _chapter_identity(title) not in {
+                    _chapter_identity(item) for item in page_titles
+                }:
+                    page_titles.append(title)
+                matched += 1
+                continue
+            if trusted_chapter:
+                trusted_chapters.add(key)
+            raw_title = pages[bookmark.page - 1][best_index]
+            if _prefer_bookmark_title(
+                raw_title, bookmark.title, trusted=trusted_chapter
+            ):
+                canonical_titles[key] = _bookmark_title(bookmark.title)
             matched += 1
-    return levels, matched
+        elif (
+            structural_depth is not None
+            and bookmark.depth == structural_depth
+            and structural_bookmark
+        ):
+            title = _bookmark_title(bookmark.title)
+            page_titles = synthetic_chapters.setdefault(bookmark.page, [])
+            if _chapter_identity(title) not in {
+                _chapter_identity(item) for item in page_titles
+            }:
+                page_titles.append(title)
+    return levels, matched, trusted_chapters, canonical_titles, synthetic_chapters
 
 
 def _match_visual_headings(
@@ -250,14 +386,20 @@ def _looks_like_toc_page(lines: list[str]) -> bool:
     if not nonempty:
         return False
     heading = " ".join(nonempty[:5]).casefold()
-    named_contents = "目录" in heading or bool(re.search(r"\bcontents\b", heading))
+    compact_heading = _normalize(heading)
+    named_contents = (
+        "目录" in heading
+        or bool(re.search(r"\bcontents\b", heading))
+        or "tableofcontents" in compact_heading
+    )
     chapter_entries = sum(bool(_CHAPTER_RE.match(line)) for line in nonempty)
+    leader_entries = sum(bool(re.search(r"\.{3,}\s*\d+\s*$", line)) for line in nonempty)
     short_entries = sum(len(line) <= 80 for line in nonempty)
     return bool(
         named_contents
-        and chapter_entries >= 2
-        and len(nonempty) >= 12
-        and short_entries / len(nonempty) >= 0.75
+        and (chapter_entries >= 2 or leader_entries >= 5)
+        and len(nonempty) >= 8
+        and (leader_entries >= 5 or short_entries / len(nonempty) >= 0.75)
     )
 
 
@@ -268,10 +410,18 @@ def _reflow_page(
     repeated_margins: set[str],
     *,
     structural_headings: bool = True,
+    trusted_chapters: set[tuple[int, int]] | None = None,
+    trusted_chapter_titles: set[str] | None = None,
+    canonical_titles: dict[tuple[int, int], str] | None = None,
+    synthetic_chapters: list[str] | None = None,
 ) -> tuple[list[str], int, int]:
     output = [f"<!-- page: {page_number} -->", ""]
     paragraph: list[str] = []
-    heading_count = room_count = 0
+    synthetic_chapters = synthetic_chapters or []
+    for title in synthetic_chapters:
+        output.extend((f"# {title}", ""))
+    heading_count = len(synthetic_chapters)
+    room_count = 0
 
     def flush() -> None:
         if not paragraph:
@@ -289,6 +439,9 @@ def _reflow_page(
     margins = set(nonempty[:3] + nonempty[-3:])
     top_lines = set(nonempty[:5])
     chapter_lines = sum(bool(_CHAPTER_RE.match(line)) for line in lines if line)
+    trusted_chapters = trusted_chapters or set()
+    trusted_chapter_titles = trusted_chapter_titles or set()
+    canonical_titles = canonical_titles or {}
     for index, line in enumerate(lines):
         if not line:
             flush()
@@ -297,7 +450,9 @@ def _reflow_page(
             continue
         if index in margins and _PAGE_NUMBER_RE.fullmatch(line):
             continue
-        level = heading_levels.get((page_number, index)) if structural_headings else None
+        key = (page_number, index)
+        display_line = canonical_titles.get(key, line)
+        level = heading_levels.get(key) if structural_headings else None
         next_line = next((value for value in lines[index + 1 :] if value), "")
         previous_line = next((value for value in reversed(lines[:index]) if value), "")
         if (
@@ -311,20 +466,45 @@ def _reflow_page(
         chapter_confirmation = bool(
             re.match(r"^(?:Chapter|Appendix)\s+[0-9A-Z]", next_line, re.IGNORECASE)
         )
-        if structural_headings and _CHAPTER_RE.match(line) and (
-            level is not None
-            or chapter_confirmation
-            or (index in top_lines and chapter_lines == 1)
+        trusted_top_level = key in trusted_chapters
+        identity = _chapter_identity(display_line)
+        duplicate_trusted_chapter = any(
+            identity == trusted
+            or (
+                len(trusted) >= 12
+                and len(identity) > len(trusted)
+                and identity.startswith(trusted)
+            )
+            for trusted in trusted_chapter_titles
+        )
+        if (
+            not trusted_top_level
+            and _CHAPTER_RE.match(display_line)
+            and duplicate_trusted_chapter
+        ):
+            # Drop duplicated running headers or visual recovery of a boundary
+            # already anchored by an outline entry elsewhere in the document.
+            continue
+        if structural_headings and _CHAPTER_RE.match(display_line) and (
+            trusted_top_level
+            or (
+                _looks_like_automatic_chapter_heading(display_line)
+                and (
+                    level is not None
+                    or chapter_confirmation
+                    or (index in top_lines and chapter_lines == 1)
+                )
+            )
         ):
             level = 1
-        elif structural_headings and _ROOM_RE.match(line):
+        elif structural_headings and _ROOM_RE.match(display_line):
             level = level or 4
             room_count += 1
-        elif structural_headings and level is None and _looks_like_all_caps_heading(line):
+        elif structural_headings and level is None and _looks_like_all_caps_heading(display_line):
             level = 5
         if level is not None:
             flush()
-            output.extend((f"{'#' * level} {line}", ""))
+            output.extend((f"{'#' * level} {display_line}", ""))
             heading_count += 1
         elif _LIST_RE.match(line):
             flush()
@@ -346,7 +526,22 @@ def build_structured_markdown(
     bookmarks = bookmarks or []
     pages = [[_clean_line(line) for line in text.splitlines()] for text in page_texts]
     repeated = _repeated_margin_lines(pages)
-    heading_levels, matched = _match_bookmarks(pages, bookmarks)
+    (
+        heading_levels,
+        matched,
+        trusted_chapters,
+        canonical_titles,
+        synthetic_chapters,
+    ) = _match_bookmarks(pages, bookmarks)
+    trusted_chapter_titles = {
+        _chapter_identity(canonical_titles.get(key, pages[key[0] - 1][key[1]]))
+        for key in trusted_chapters
+    }
+    trusted_chapter_titles.update(
+        _chapter_identity(title)
+        for titles in synthetic_chapters.values()
+        for title in titles
+    )
     visual_levels, matched_visual = _match_visual_headings(pages, visual_headings or {})
     for key, level in visual_levels.items():
         heading_levels.setdefault(key, level)
@@ -364,6 +559,10 @@ def build_structured_markdown(
             heading_levels,
             repeated,
             structural_headings=page_number not in toc_pages,
+            trusted_chapters=trusted_chapters,
+            trusted_chapter_titles=trusted_chapter_titles,
+            canonical_titles=canonical_titles,
+            synthetic_chapters=synthetic_chapters.get(page_number),
         )
         output.extend(rendered)
         heading_count += headings
@@ -381,6 +580,7 @@ def build_structured_markdown(
         {
             "bookmark_count": len(bookmarks),
             "matched_bookmarks": matched,
+            "synthetic_outline_headings": sum(map(len, synthetic_chapters.values())),
             "visual_heading_count": len(visual_levels),
             "matched_visual_headings": matched_visual,
             "heading_count": heading_count,
