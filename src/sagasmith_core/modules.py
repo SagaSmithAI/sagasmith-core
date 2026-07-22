@@ -922,8 +922,9 @@ class ModuleService:
         content_key: str,
         content_kind: str,
         normalized_content: str,
-        source_asset_id: str,
-        page_number: int,
+        source_asset_id: str | None = None,
+        page_number: int | None = None,
+        source_chunk_ids: Sequence[str] | None = None,
         reviewer: str,
         observation: str,
         metadata: dict[str, Any] | None = None,
@@ -942,8 +943,20 @@ class ModuleService:
             raise ValueError("normalized_content is required")
         if len(content) > 200_000:
             raise ValueError("normalized_content exceeds 200000 characters")
-        if isinstance(page_number, bool) or not isinstance(page_number, int) or page_number < 1:
-            raise ValueError("page_number must be a 1-based integer")
+        chunk_ids = list(dict.fromkeys(str(item) for item in source_chunk_ids or [] if str(item)))
+        visual_evidence = source_asset_id is not None or page_number is not None
+        text_evidence = bool(chunk_ids)
+        if visual_evidence == text_evidence:
+            raise ValueError(
+                "content review requires exactly one evidence mode: source asset/page or chunks"
+            )
+        if visual_evidence and (
+            not source_asset_id
+            or isinstance(page_number, bool)
+            or not isinstance(page_number, int)
+            or page_number < 1
+        ):
+            raise ValueError("visual content review requires a PDF/image asset and 1-based page")
         if not reviewer_value:
             raise ValueError("reviewer is required")
         if not observation_value or len(observation_value) > 500:
@@ -970,21 +983,65 @@ class ModuleService:
             scene = session.get(ModuleScene, scene_id)
             if scene is None or scene.module_id != module_id:
                 raise ValueError("content review scene must belong to the module")
-            asset = session.get(ModuleAsset, source_asset_id)
-            if asset is None or asset.module_id != module_id:
-                raise ValueError("content review asset must belong to the module")
-            media_type = str(asset.media_type or "").casefold()
-            if media_type != "application/pdf" and not media_type.startswith("image/"):
-                raise ValueError("content review requires a PDF or rendered image asset")
-            asset_metadata = dict(asset.metadata_json or {})
-            if media_type == "application/pdf":
-                page_count = int(asset_metadata.get("page_count") or 0)
-                if page_count and page_number > page_count:
-                    raise ValueError(f"content review page exceeds PDF page count {page_count}")
+            evidence: dict[str, Any]
+            if visual_evidence:
+                asset = session.get(ModuleAsset, source_asset_id)
+                if asset is None or asset.module_id != module_id:
+                    raise ValueError("content review asset must belong to the module")
+                media_type = str(asset.media_type or "").casefold()
+                if media_type != "application/pdf" and not media_type.startswith("image/"):
+                    raise ValueError("content review requires a PDF or rendered image asset")
+                asset_metadata = dict(asset.metadata_json or {})
+                if media_type == "application/pdf":
+                    page_count = int(asset_metadata.get("page_count") or 0)
+                    if page_count and page_number > page_count:
+                        raise ValueError(
+                            f"content review page exceeds PDF page count {page_count}"
+                        )
+                else:
+                    source_page = int(asset_metadata.get("source_page") or 0)
+                    if source_page and source_page != page_number:
+                        raise ValueError(
+                            "content review page must match rendered asset source_page"
+                        )
+                evidence = {
+                    "asset_id": asset.id,
+                    "asset_checksum": asset.checksum,
+                    "page": page_number,
+                    "reviewer": reviewer_value,
+                    "observation": observation_value,
+                    "confidence": "reviewed_image",
+                }
             else:
-                source_page = int(asset_metadata.get("source_page") or 0)
-                if source_page and source_page != page_number:
-                    raise ValueError("content review page must match rendered asset source_page")
+                chunk_rows = list(
+                    session.scalars(select(ModuleChunk).where(ModuleChunk.id.in_(chunk_ids)))
+                )
+                chunks_by_id = {row.id: row for row in chunk_rows}
+                if len(chunks_by_id) != len(chunk_ids):
+                    raise ValueError("content review source chunks were not all found")
+                ordered_chunks = [chunks_by_id[chunk_id] for chunk_id in chunk_ids]
+                if any(
+                    row.module_id != module_id or row.scene_id != scene_id
+                    for row in ordered_chunks
+                ):
+                    raise ValueError(
+                        "content review source chunks must belong to the module scene"
+                    )
+                page_starts = [
+                    row.page_start for row in ordered_chunks if row.page_start is not None
+                ]
+                page_ends = [row.page_end for row in ordered_chunks if row.page_end is not None]
+                evidence = {
+                    "source_chunk_ids": chunk_ids,
+                    "source_chunk_checksums": {
+                        row.id: row.content_hash for row in ordered_chunks
+                    },
+                    "page_start": min(page_starts) if page_starts else None,
+                    "page_end": max(page_ends) if page_ends else None,
+                    "reviewer": reviewer_value,
+                    "observation": observation_value,
+                    "confidence": "reviewed_text",
+                }
 
             existing = session.scalar(
                 select(ModuleContentReview).where(
@@ -1004,14 +1061,7 @@ class ModuleService:
                 content_kind=kind,
                 normalized_content=content,
                 checksum=checksum,
-                evidence_json={
-                    "asset_id": asset.id,
-                    "asset_checksum": asset.checksum,
-                    "page": page_number,
-                    "reviewer": reviewer_value,
-                    "observation": observation_value,
-                    "confidence": "reviewed_image",
-                },
+                evidence_json=evidence,
                 metadata_json=metadata_value,
             )
             session.add(row)
@@ -1083,6 +1133,42 @@ class ModuleService:
                     "title": row.ModuleSource.title,
                 },
             }
+
+    def list_chunks(
+        self,
+        campaign_id: str,
+        module_id: str,
+        *,
+        scene_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return ordered, source-scoped chunks for downstream content review."""
+        with self.database.transaction() as session:
+            source = session.get(ModuleSource, module_id)
+            if source is None or source.campaign_id != campaign_id:
+                raise LookupError(module_id)
+            statement = (
+                select(ModuleChunk, ModuleScene)
+                .join(ModuleScene, ModuleScene.id == ModuleChunk.scene_id)
+                .where(ModuleChunk.module_id == module_id)
+                .order_by(ModuleChunk.ordinal, ModuleChunk.id)
+            )
+            if scene_id is not None:
+                statement = statement.where(ModuleChunk.scene_id == scene_id)
+            return [
+                {
+                    "id": row.ModuleChunk.id,
+                    "module_id": module_id,
+                    "scene_id": row.ModuleChunk.scene_id,
+                    "scene_title": row.ModuleScene.title,
+                    "ordinal": row.ModuleChunk.ordinal,
+                    "heading_path": list(row.ModuleChunk.heading_path),
+                    "content": row.ModuleChunk.content,
+                    "chunk_type": row.ModuleChunk.chunk_type,
+                    "page_start": row.ModuleChunk.page_start,
+                    "page_end": row.ModuleChunk.page_end,
+                }
+                for row in session.execute(statement)
+            ]
 
     def read_scene(
         self,

@@ -85,6 +85,33 @@ def test_module_ingest_search_and_progress(database) -> None:
     assert projected[1]["inherited_from_party"] is True
 
 
+def test_module_chunks_can_be_listed_in_source_order(database) -> None:
+    campaign = CampaignService(database).create(system_id="dnd5e", name="Chunk review")
+    service = ModuleService(database)
+    imported = service.ingest(
+        campaign_id=campaign.id,
+        source_key="creatures.md",
+        title="Creatures",
+        content=(
+            "# Appendix B\n"
+            "## Monsters\n"
+            "##### Goblin\nSmall humanoid, neutral evil.\n"
+            "##### Actions\nScimitar. Melee Weapon Attack.\n"
+        ),
+    )
+    scene_id = service.scene_index(campaign.id)[0]["scene_id"]
+
+    chunks = service.list_chunks(campaign.id, imported.module_id, scene_id=scene_id)
+
+    assert [item["ordinal"] for item in chunks] == sorted(
+        item["ordinal"] for item in chunks
+    )
+    assert all(item["module_id"] == imported.module_id for item in chunks)
+    assert all(item["scene_id"] == scene_id for item in chunks)
+    assert any(item["heading_path"][-1] == "Goblin" for item in chunks)
+    assert any(item["heading_path"][-1] == "Actions" for item in chunks)
+
+
 def test_module_parser_preserves_front_matter_before_first_chapter() -> None:
     chapters = MarkdownModuleParser().parse(
         "<!-- page: 1 -->\n## Adventure Overview\nThe city has fallen.\n"
@@ -476,3 +503,41 @@ def test_image_only_module_content_can_be_reviewed_with_page_evidence(database, 
     assert [item["id"] for item in modules.list_content_reviews(
         campaign.id, imported.module_id, content_kind="dnd5e_2014_statblock"
     )] == [reviewed["id"]]
+
+
+def test_text_module_content_review_keeps_exact_chunk_evidence(database) -> None:
+    campaign = CampaignService(database).create(system_id="dnd5e", name="Text review")
+    modules = ModuleService(database)
+    imported = modules.ingest(
+        campaign_id=campaign.id,
+        source_key="monsters.md",
+        title="Monsters",
+        content=(
+            "<!-- page: 8 -->\n# Appendix B\n## Goblin\n"
+            "Small humanoid, neutral evil Armor Class 15 Hit Points 7 Speed 30 ft.\n"
+            "##### Actions\nScimitar. Melee Weapon Attack.\n"
+        ),
+    )
+    scene = modules.scene_index(campaign.id)[0]
+    chunks = modules.list_chunks(
+        campaign.id, imported.module_id, scene_id=scene["scene_id"]
+    )
+
+    reviewed = modules.review_content(
+        campaign_id=campaign.id,
+        module_id=imported.module_id,
+        scene_id=scene["scene_id"],
+        content_key="goblin",
+        content_kind="dnd5e_2014_statblock",
+        normalized_content="# Goblin\n\n*Small humanoid, neutral evil*",
+        source_chunk_ids=[item["id"] for item in chunks],
+        reviewer="dm:test",
+        observation="Reviewed the normalized text against every source chunk.",
+    )
+
+    assert reviewed["evidence"]["confidence"] == "reviewed_text"
+    assert reviewed["evidence"]["source_chunk_ids"] == [
+        item["id"] for item in chunks
+    ]
+    assert reviewed["evidence"]["page_start"] == 8
+    assert reviewed["evidence"]["page_end"] == 8
