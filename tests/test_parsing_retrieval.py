@@ -155,7 +155,12 @@ def test_fts5_hits_produces_results_on_sqlite(database) -> None:
         campaign_id=campaign.id,
         source_key="fts_demo.md",
         title="FTS Demo",
-        content="# Ch1\n## Gate\nGuarded by wolves.\n## Library\nBooks about fireball.",
+        content=(
+            "# Ch1\n## Gate\nGuarded by wolves.\n"
+            "#### D12. Bane's Altar\nThe prisoners are chained here.\n"
+            "#### D13. Morgue\nFlennis studies a corpse.\n"
+            "## Library\nBooks about fireball."
+        ),
     )
 
     # Run the migration to create FTS5 tables
@@ -169,6 +174,11 @@ def test_fts5_hits_produces_results_on_sqlite(database) -> None:
     with db.transaction() as session:
         hits_cjk = fts5_hits(session, "module_fts", "fireball", limit=5)
     assert len(hits_cjk) >= 1, f"expected at least 1 hit for 'fireball', got {hits_cjk}"
+
+    room_hits = service.search(campaign_id=campaign.id, query="D13")
+    assert len(room_hits) >= 1
+    assert room_hits[0].heading_path[-1] == "D13. Morgue"
+    assert "Flennis" in room_hits[0].content
 
     # Search through the public API should also use FTS5
     api_hits = service.search(campaign_id=campaign.id, query="wolves")

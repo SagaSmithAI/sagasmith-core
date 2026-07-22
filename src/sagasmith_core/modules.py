@@ -1352,6 +1352,10 @@ class ModuleService:
             if row.ModuleScene.title.casefold() == query.casefold()
             or row.ModuleChapter.title.casefold() == query.casefold()
             or row.ModuleSource.title.casefold() == query.casefold()
+            or any(
+                str(heading).casefold() == query.casefold()
+                for heading in row.ModuleChunk.heading_path
+            )
         ]
         exact_ids = {row.ModuleChunk.id for row in exact}
 
@@ -1398,7 +1402,7 @@ class ModuleService:
                             module_title=row.ModuleSource.title,
                             chapter_title=row.ModuleChapter.title,
                             scene_title=row.ModuleScene.title,
-                            heading_paths=" ".join(row.ModuleScene.headings or []),
+                            heading_paths=" ".join(row.ModuleChunk.heading_path or []),
                             keywords=" ".join(row.ModuleScene.keywords or []),
                             tags=" ".join(row.ModuleScene.metadata_json.get("tags", [])),
                             scene_type=row.ModuleScene.scene_type,
