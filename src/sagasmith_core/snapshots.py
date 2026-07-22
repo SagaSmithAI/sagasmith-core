@@ -669,17 +669,26 @@ class SnapshotService:
             )
             .values(applied=False, redoable=False)
         )
+        cursor_states: dict[tuple[bool, bool], list[str]] = {}
         for revision_id, item in cursor.items():
+            state = (bool(item["applied"]), bool(item["redoable"]))
+            cursor_states.setdefault(state, []).append(revision_id)
+        for (applied, redoable), revision_ids in cursor_states.items():
+            if not applied and not redoable:
+                continue
             session.execute(
                 update(StateRevision)
                 .where(
                     StateRevision.campaign_id == campaign.id,
-                    or_(StateRevision.id == revision_id, StateRevision.branch_key == revision_id),
+                    or_(
+                        StateRevision.id.in_(revision_ids),
+                        StateRevision.branch_key.in_(revision_ids),
+                    ),
                     StateRevision.mutation_group_id.in_(
                         select(MutationGroup.id).where(MutationGroup.branch_id == branch.id)
                     ),
                 )
-                .values(applied=item["applied"], redoable=item["redoable"])
+                .values(applied=applied, redoable=redoable)
             )
         # Database sessions deliberately disable autoflush.  A restore immediately
         # creates its new branch-head snapshot, so materialized characters and scene
@@ -878,11 +887,21 @@ class SnapshotService:
             ):
                 raise SnapshotIntegrityError("snapshot event ledger differs from its full payload")
 
-        for item in payload.get("revision_cursor", []):
-            revision_id = str(item.get("id") or "")
-            revision = session.get(StateRevision, revision_id) if revision_id else None
-            if revision is None or revision.campaign_id != row.campaign_id:
-                raise SnapshotIntegrityError("snapshot revision cursor is incomplete")
+        revision_ids = [
+            str(item.get("id") or "") for item in payload.get("revision_cursor", [])
+        ]
+        if not all(revision_ids) or len(revision_ids) != len(set(revision_ids)):
+            raise SnapshotIntegrityError("snapshot revision cursor is incomplete")
+        actual_revision_ids = set(
+            session.scalars(
+                select(StateRevision.id).where(
+                    StateRevision.campaign_id == row.campaign_id,
+                    StateRevision.id.in_(revision_ids),
+                )
+            )
+        )
+        if actual_revision_ids != set(revision_ids):
+            raise SnapshotIntegrityError("snapshot revision cursor is incomplete")
 
     @staticmethod
     def _payload_revision_map(items: list[dict[str, Any]], label: str) -> dict[str, str]:

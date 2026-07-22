@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, event, select
 
 from sagasmith_core import (
     ActorKnowledgeService,
@@ -936,6 +936,58 @@ def test_branch_checkout_refuses_to_mix_unsaved_state_with_saved_continuity(data
     snapshots.create(campaign.id, label="Clock one")
     snapshots.checkout_branch(campaign.id, alternate.id)
     assert campaigns.get(campaign.id).state == {"clock": 0}
+
+
+def test_branch_checkout_bulk_restores_large_revision_cursor(database) -> None:
+    campaigns = CampaignService(database)
+    campaign = campaigns.create(system_id="dnd5e", name="Bulk cursor", state={"step": -1})
+    mutations = StateMutationService(database)
+    snapshots = SnapshotService(database)
+    branches = BranchService(database)
+
+    for step in range(60):
+        current = campaigns.get(campaign.id)
+        mutations.replace(
+            campaign.id,
+            campaign_state={"step": step},
+            expected_campaign_revision=current.revision,
+            operation="test.bulk-cursor",
+            idempotency_key=f"bulk-cursor-{step}",
+        )
+    base = snapshots.create(campaign.id, label="Sixty revisions")
+    alternate = branches.create(
+        campaign.id,
+        name="bulk-cursor-copy",
+        from_snapshot_id=base.id,
+    )
+    current = campaigns.get(campaign.id)
+    mutations.replace(
+        campaign.id,
+        campaign_state={"step": 61},
+        expected_campaign_revision=current.revision,
+        operation="test.bulk-cursor",
+        idempotency_key="bulk-cursor-main-only",
+    )
+    snapshots.create(campaign.id, label="Main advances")
+
+    statements: list[str] = []
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _many) -> None:
+        statements.append(statement)
+
+    event.listen(database.engine, "before_cursor_execute", record_statement)
+    try:
+        snapshots.checkout_branch(campaign.id, alternate.id)
+    finally:
+        event.remove(database.engine, "before_cursor_execute", record_statement)
+
+    assert campaigns.get(campaign.id).state == {"step": 59}
+    revision_statements = [
+        statement
+        for statement in statements
+        if "state_revisions" in statement.casefold()
+    ]
+    assert len(revision_statements) <= 12
 
 
 def test_state_mutation_replaces_campaign_and_character_documents_atomically(database) -> None:
