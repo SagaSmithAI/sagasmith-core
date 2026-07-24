@@ -84,3 +84,25 @@ def test_idempotency_rejects_key_reuse_with_different_payload(database) -> None:
     assert replay is not None and replay.replayed is True
     with pytest.raises(IdempotencyConflictError):
         service.lookup("campaign:c1", "request-1", {"amount": 2})
+
+
+def test_campaign_idempotency_receipt_recovers_response_without_stale_request(database) -> None:
+    campaign = CampaignService(database).create(system_id="dnd5e", name="Receipt")
+    service = IdempotencyService(database)
+    service.remember(
+        f"campaign:{campaign.id}",
+        "long-rest-1",
+        {"expected_revision": 4},
+        {"status": "committed", "world_time": {"elapsed_minutes": 480}},
+        campaign_id=campaign.id,
+    )
+
+    receipt = service.receipt(campaign.id, "long-rest-1")
+
+    assert receipt.replayed is True
+    assert receipt.response == {
+        "status": "committed",
+        "world_time": {"elapsed_minutes": 480},
+    }
+    with pytest.raises(LookupError, match="not found"):
+        service.receipt(campaign.id, "missing")

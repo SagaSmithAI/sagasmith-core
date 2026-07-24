@@ -39,6 +39,24 @@ class IdempotencyService:
         with self.database.transaction() as session:
             return self.lookup_in_session(session, scope, key, payload)
 
+    def receipt(self, campaign_id: str, key: str) -> IdempotencyResult:
+        """Read one campaign-owned replay receipt without reconstructing its request."""
+        with self.database.transaction() as session:
+            rows = list(
+                session.scalars(
+                    select(IdempotencyRecord).where(
+                        IdempotencyRecord.campaign_id == campaign_id,
+                        IdempotencyRecord.key == key,
+                    )
+                )
+            )
+            if not rows:
+                raise LookupError(f"idempotency receipt not found: {key}")
+            if len(rows) != 1:
+                raise RuntimeError(f"idempotency receipt is ambiguous: {key}")
+            row = rows[0]
+            return IdempotencyResult(key, True, dict(row.response), row.mutation_group_id)
+
     def lookup_in_session(
         self, session, scope: str, key: str, payload: Any
     ) -> IdempotencyResult | None:
