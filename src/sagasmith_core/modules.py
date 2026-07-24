@@ -1131,11 +1131,26 @@ class ModuleService:
                 .join(ModuleSource, ModuleSource.id == ModuleChunk.module_id)
                 .where(ModuleChunk.id == chunk_id)
             ).one()
+            heading_path = list(row.ModuleChunk.heading_path)
+            content_sha256 = hashlib.sha256(
+                row.ModuleChunk.content.encode("utf-8")
+            ).hexdigest()
+            source_ref = {
+                "module_id": row.ModuleSource.id,
+                "scene_id": row.ModuleScene.id,
+                "chunk_id": row.ModuleChunk.id,
+                "page_start": row.ModuleChunk.page_start,
+                "page_end": row.ModuleChunk.page_end,
+                "heading_path": heading_path,
+                "content_sha256": content_sha256,
+            }
             return {
                 "chunk_id": row.ModuleChunk.id,
                 "campaign_id": row.ModuleSource.campaign_id,
                 "content": row.ModuleChunk.content,
-                "heading_path": list(row.ModuleChunk.heading_path),
+                "content_sha256": content_sha256,
+                "source_ref": source_ref,
+                "heading_path": heading_path,
                 "chunk_type": row.ModuleChunk.chunk_type,
                 "page_start": row.ModuleChunk.page_start,
                 "page_end": row.ModuleChunk.page_end,

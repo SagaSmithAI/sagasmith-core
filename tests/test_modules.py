@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 
 from sagasmith_core.campaigns import CampaignService
@@ -26,6 +28,7 @@ def test_module_ingest_search_and_progress(database) -> None:
     )
 
     hits = service.search(campaign_id=campaign.id, query="wolves")
+    expanded = service.expand(hits[0].id)
     progress = service.set_scene_progress(
         campaign_id=campaign.id,
         scene_id=hits[0].metadata["scene_id"],
@@ -44,6 +47,18 @@ def test_module_ingest_search_and_progress(database) -> None:
     assert hits[0].title == "Broken Gate"
     assert hits[0].metadata["scene_type"] == "section"
     assert hits[0].metadata["visibility"] == "keeper"
+    assert expanded["content_sha256"] == hashlib.sha256(
+        expanded["content"].encode("utf-8")
+    ).hexdigest()
+    assert expanded["source_ref"] == {
+        "module_id": result.module_id,
+        "scene_id": hits[0].metadata["scene_id"],
+        "chunk_id": hits[0].id,
+        "page_start": expanded["page_start"],
+        "page_end": expanded["page_end"],
+        "heading_path": expanded["heading_path"],
+        "content_sha256": expanded["content_sha256"],
+    }
     assert progress["progress"] == 40
     assert preserved["current_room"] == "Gate"
     assert preserved["state"] == {"wolves_defeated": False}
